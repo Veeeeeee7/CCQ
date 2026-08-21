@@ -1,0 +1,33 @@
+{
+    "raw": [
+        "provider_id",
+        "qr_rating",
+        "qr_rated",
+        "program_type",
+        "scholarship_eligible",
+        "enrollment_availability",
+        "enrollment_age_6wk_17mo",
+        "enrollment_age_18_23mo",
+        "enrollment_age_0_23mo",
+        "enrollment_age_2yr",
+        "enrollment_age_3yr",
+        "enrollment_age_4yr",
+        "enrollment_age_5yr_preschool",
+        "enrollment_age_5_15yr"
+    ],
+    "full": [
+        "provider_id",
+        "qr_rating",
+        "qr_rated",
+        "scholarship_eligible",
+        "enrollment_availability",
+        "enrollment_age_6wk_17mo",
+        "enrollment_age_18_23mo",
+        "enrollment_age_0_23mo",
+        "enrollment_age_2yr",
+        "enrollment_age_3yr",
+        "enrollment_age_4yr",
+        "enrollment_age_5yr_preschool",
+        "enrollment_age_5_15yr"
+    ]
+}

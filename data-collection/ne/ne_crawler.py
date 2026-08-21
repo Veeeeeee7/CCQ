@@ -1,0 +1,539 @@
+"""
+ne_crawler.py — Nebraska Step Up to Quality provider crawler.
+
+Crawls every `child-care-facility` page on the STQ finder and emits one row per
+provider page.
+
+    https://stepuptoquality.ne.gov/child-care-facility/{slug}/
+
+Why plain requests and not Playwright
+-------------------------------------
+The finder *looks* like it needs a browser — the search page is JS-driven, the
+footer announces "This site is protected by reCAPTCHA", and there is no
+`child-care-facility` post type in wp/v2. All three are red herrings:
+
+  * the reCAPTCHA is loaded by the `gravityformsrecaptcha` plugin and only
+    guards the newsletter form; nothing gates provider pages;
+  * search results are ordinary server-rendered GETs
+    (/provider-search-results/page/N/?address=...&radius=...), and
+  * every provider has a plain WordPress permalink whose full content is in the
+    initial HTML.
+
+So the lightest tool that works is `requests` + BeautifulSoup. We don't even
+touch the search: the seed enumerates every provider URL from the Yoast
+sitemaps, which is both complete and cheap.
+
+Page shape
+----------
+The hero carries the name (h1), the program type (h2) and — only when the
+provider is rated — a `.step-badge` holding the Step (1-5).
+
+The body is a grid of `.plumb-columns .column` blocks. Each is either a
+label/value pair::
+
+    <div class="column"><p><span class="label">License Number</span> CCC8794</p></div>
+
+or a label followed by a list::
+
+    <div class="column">
+      <p><span class="label">Age of Children Served</span></p>
+      <ul class="simple-list tag-list"><li>Infants</li>...</ul>
+    </div>
+
+Accreditations use their own `ul.accredidation-list`, one <li> per body with a
+name span and a `span.date` validity range; we keep those as JSON.
+
+Fields are *omitted* when a provider has no value for them, and unrated
+providers are sparse: e.g. Zackery Daycare (FI10967) has only name, program
+type, license number and contact — no step badge, no capacity, no director.
+Some pages (typically public-school preschools, e.g. Winside Elementary School)
+carry no License Number at all. We still record those rows, with
+`license_number` empty and `has_license_number=0`, and let a later step
+drop them — the crawler's job is a faithful capture, not filtering.
+
+Because the label set is discovered rather than fixed, any label we don't have
+a dedicated column for is preserved in the `extra_fields` JSON blob, so a site
+change surfaces as data rather than as silent loss.
+
+Grain: one row per facility page (slug). A license number can appear on more
+than one page (duplicate slugs like `waldecker-connie` / `waldecker-connie-2`);
+collapsing to one row per license number happens in cleaning, preferring the
+rated page.
+
+Usage:
+    python ne_crawler.py --limit 25        # smoke test
+    python ne_crawler.py                   # full run (resumable)
+
+Deps: pip install requests pandas beautifulsoup4
+"""
+
+import argparse
+import json
+import os
+import random
+import re
+import time
+
+import pandas as pd
+import requests
+from bs4 import BeautifulSoup
+
+# ---------------------------------------------------------------------------
+# config
+# ---------------------------------------------------------------------------
+
+BASE_URL = 'https://stepuptoquality.ne.gov'
+SEED_CSV = 'ne_data/ne_seed.csv'
+OUT_CSV = 'ne_data/ne_records.csv'
+LOG_FILE = 'ne_crawler_log.txt'
+
+UA = ('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
+      'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
+
+# Selectors, kept together so a theme change is a one-line fix.
+SEL_STEP_BADGE = '.step-badge'
+SEL_COLUMNS = '.plumb-columns .column'
+SEL_ACCRED_LIST = 'ul.accredidation-list'
+SEL_PHONE = 'li.icon-phone, li.has-icon.icon-phone'
+SEL_ADDRESS = 'li.icon-address, li.has-icon.icon-address'
+
+REQUEST_TIMEOUT = 45
+RETRIES = 3
+DELAY_RANGE = (0.6, 1.4)        # polite pause between providers
+
+# Labels we promote to first-class columns. Anything else -> extra_fields.
+LABEL_TO_FIELD = {
+    'director': 'director',
+    'license number': 'license_number',
+    'age of children served': 'age_groups',
+    'program accreditations': 'accreditations',
+    'full time staff': 'full_time_staff',
+    'part time staff': 'part_time_staff',
+    'capacity': 'capacity',
+    'other program information': 'other_program_info',
+}
+
+MULTIVALUE_SEP = '; '
+
+
+# ---------------------------------------------------------------------------
+# logging
+# ---------------------------------------------------------------------------
+
+def create_log_file(path=LOG_FILE):
+    if os.path.exists(path):
+        os.remove(path)
+    open(path, 'w').close()
+
+
+def log(message, file=LOG_FILE):
+    with open(file, 'a', encoding='utf-8') as f:
+        f.write(message + '\n')
+    print(message)
+
+
+# ---------------------------------------------------------------------------
+# transport
+# ---------------------------------------------------------------------------
+
+def fetch(url, session):
+    last = None
+    for attempt in range(RETRIES):
+        try:
+            r = session.get(url, timeout=REQUEST_TIMEOUT)
+            if r.status_code == 404:
+                return None
+            r.raise_for_status()
+            return r.text
+        except Exception as e:                                   # noqa: BLE001
+            last = e
+            time.sleep(1.5 * (attempt + 1))
+    raise last
+
+
+# ---------------------------------------------------------------------------
+# small parsing helpers
+# ---------------------------------------------------------------------------
+
+def _clean(s):
+    if s is None:
+        return None
+    s = re.sub(r'\s+', ' ', str(s)).strip()
+    return s or None
+
+
+def _norm_license(value):
+    """License numbers are strings: letter prefix + digits (CCC8794, FI11670,
+    FII9561). Strip a stray float '.0'; never zfill (NE does not zero-pad)."""
+    v = _clean(value)
+    if not v:
+        return None
+    v = re.sub(r'\.0$', '', v)
+    return v.upper()
+
+
+def _label_of(column):
+    span = column.select_one('p span.label')
+    return _clean(span.get_text(' ', strip=True)).lower() if span else None
+
+
+def _value_of(column):
+    """Text of the <p> with the label span removed — that's the scalar value."""
+    p = column.find('p')
+    if p is None:
+        return None
+    clone = BeautifulSoup(str(p), 'html.parser')
+    span = clone.select_one('span.label')
+    if span:
+        span.decompose()
+    return _clean(clone.get_text(' ', strip=True))
+
+
+def _list_items(column):
+    ul = column.find('ul')
+    if ul is None:
+        return []
+    return [t for t in (_clean(li.get_text(' ', strip=True))
+                        for li in ul.find_all('li')) if t]
+
+
+def _accreditations(column):
+    """[{'name': ..., 'dates': ...}] from ul.accredidation-list."""
+    ul = column.select_one(SEL_ACCRED_LIST) or column.find('ul')
+    if ul is None:
+        return []
+    out = []
+    for li in ul.find_all('li'):
+        date_el = li.select_one('span.date')
+        dates = _clean(date_el.get_text(' ', strip=True)) if date_el else None
+        name_el = li.select_one('span.font-size-large')
+        if name_el:
+            name = _clean(name_el.get_text(' ', strip=True))
+        else:
+            clone = BeautifulSoup(str(li), 'html.parser')
+            for d in clone.select('span.date'):
+                d.decompose()
+            name = _clean(clone.get_text(' ', strip=True))
+        if name or dates:
+            out.append({'name': name, 'dates': dates})
+    return out
+
+
+# ---------------------------------------------------------------------------
+# sections — each returns a dict; each has an empty_*() twin so a failure in
+# one section never kills the row.
+# ---------------------------------------------------------------------------
+
+def empty_header():
+    return {'facility_name': None, 'program_type': None, 'step_rating': None}
+
+
+def crawl_header(soup):
+    out = empty_header()
+    h1 = soup.find('h1')
+    if h1 is not None:
+        out['facility_name'] = _clean(h1.get_text(' ', strip=True))
+        h2 = h1.find_next('h2')
+        if h2 is not None:
+            out['program_type'] = _clean(h2.get_text(' ', strip=True))
+    badge = soup.select_one(SEL_STEP_BADGE)
+    if badge is not None:
+        # The badge text is a bare digit ("3"); unrated providers have no badge.
+        m = re.search(r'\d+', badge.get_text(' ', strip=True) or '')
+        if m:
+            out['step_rating'] = m.group(0)
+    return out
+
+
+def empty_program():
+    return {'license_number': None, 'director': None, 'age_groups': None,
+            'full_time_staff': None, 'part_time_staff': None, 'capacity': None,
+            'other_program_info': None, 'accreditations': None,
+            'extra_fields': None}
+
+
+def crawl_program(soup):
+    out = empty_program()
+    extra = {}
+    for column in soup.select(SEL_COLUMNS):
+        label = _label_of(column)
+        if not label:
+            continue
+        field = LABEL_TO_FIELD.get(label)
+
+        if field == 'accreditations':
+            accs = _accreditations(column)
+            out['accreditations'] = json.dumps(accs, ensure_ascii=False) if accs else None
+        elif field in ('age_groups', 'other_program_info'):
+            items = _list_items(column)
+            out[field] = MULTIVALUE_SEP.join(items) if items else None
+        elif field:
+            out[field] = _value_of(column)
+        else:
+            # Unknown label: keep it rather than lose it.
+            items = _list_items(column)
+            extra[label] = MULTIVALUE_SEP.join(items) if items else _value_of(column)
+
+    out['license_number'] = _norm_license(out['license_number'])
+    out['extra_fields'] = json.dumps(extra, ensure_ascii=False) if extra else None
+    return out
+
+
+def empty_contact():
+    return {'phone': None, 'address_raw': None, 'street': None, 'city': None,
+            'state': None, 'zip_code': None}
+
+
+_ADDR_TAIL = re.compile(r'^(?P<city>.+?)\s*,\s*(?P<state>[A-Za-z]{2})\s*,?\s*'
+                        r'(?P<zip>\d{5}(?:-\d{4})?)\s*$')
+
+
+def crawl_contact(soup):
+    out = empty_contact()
+    phone_el = soup.select_one(SEL_PHONE)
+    if phone_el is not None:
+        out['phone'] = _clean(phone_el.get_text(' ', strip=True))
+
+    addr_el = soup.select_one(SEL_ADDRESS)
+    if addr_el is not None:
+        # Keep <br> as a line break so street and city/state/zip stay separable.
+        raw = addr_el.get_text('\n', strip=True)
+        lines = [_clean(l) for l in raw.split('\n') if _clean(l)]
+        out['address_raw'] = _clean(' '.join(lines))
+        if lines:
+            m = _ADDR_TAIL.match(lines[-1])
+            if m:
+                out['street'] = _clean(' '.join(lines[:-1])) or None
+                out['city'] = _clean(m.group('city'))
+                out['state'] = m.group('state').upper()
+                out['zip_code'] = m.group('zip')
+            else:
+                # Single-line / unparseable: keep the raw text, don't guess.
+                out['street'] = out['address_raw']
+    return out
+
+
+def empty_meta():
+    return {'facility_id': None}
+
+
+_FACILITY_ID = re.compile(r'[?&]facility=(\d+)')
+
+
+def crawl_meta(soup):
+    """The site's internal WP post id. Not the licensing ID, but a stable
+    secondary key (and the only key on pages that lack a license number)."""
+    out = empty_meta()
+    # The "Favorite" control carries the post id; prefer it over a bare
+    # [data-id] match, which could pick up an unrelated widget.
+    node = soup.select_one('.favorites-save[data-id]')
+    if node is not None and (node.get('data-id') or '').strip().isdigit():
+        out['facility_id'] = node['data-id'].strip()
+    if out['facility_id'] is None:
+        # Fallback: the Print Visitation Checklist links carry ?facility=<id>.
+        for a in soup.select('a[href*="facility="]'):
+            m = _FACILITY_ID.search(a.get('href', ''))
+            if m:
+                out['facility_id'] = m.group(1)
+                break
+    return out
+
+
+# ---------------------------------------------------------------------------
+# rectangular output + resume
+# ---------------------------------------------------------------------------
+
+def all_columns():
+    cols = ['slug', 'facility_url']
+    for fn in (empty_header, empty_program, empty_contact, empty_meta):
+        cols.extend(fn().keys())
+    cols.extend(['has_license_number', 'errors'])
+    return cols
+
+
+def append_row(row, output_csv):
+    cols = all_columns()
+    full = {}
+    for c in cols:
+        v = row.get(c)
+        if isinstance(v, str):
+            v = re.sub(r'[\r\n]+', ' ', v).strip() or None
+        full[c] = v
+    parent = os.path.dirname(output_csv)
+    if parent and not os.path.exists(parent):
+        os.makedirs(parent, exist_ok=True)
+    exists = os.path.exists(output_csv) and os.path.getsize(output_csv) > 0
+    pd.DataFrame([full], columns=cols).to_csv(
+        output_csv, mode='a', header=not exists, index=False)
+
+
+def load_completed(output_csv):
+    if not output_csv or not os.path.exists(output_csv):
+        return set()
+    try:
+        df = pd.read_csv(output_csv, dtype=str, usecols=['slug'])
+        return set(df['slug'].dropna().str.strip())
+    except Exception as e:                                       # noqa: BLE001
+        log(f'Could not read existing {output_csv}: {e}')
+        return set()
+
+
+def load_seed(seed_csv):
+    if not os.path.exists(seed_csv):
+        raise FileNotFoundError(
+            f'Seed CSV not found: {seed_csv}.')
+    df = pd.read_csv(seed_csv, dtype=str)
+    for c in ('slug', 'facility_url'):
+        if c not in df.columns:
+            raise ValueError(f'Seed needs a {c} column; got {list(df.columns)}')
+    df = (df[df['facility_url'].notna()]
+          .drop_duplicates(subset='slug').reset_index(drop=True))
+    return df
+
+
+# ---------------------------------------------------------------------------
+# driver
+# ---------------------------------------------------------------------------
+
+def crawl_one(url, session):
+    """Fetch + parse one provider page. Each section is independently guarded:
+    a broken field records its section name in `errors` and leaves the rest of
+    the row intact."""
+    html = fetch(url, session)
+    if html is None:
+        return None, 'http_404'
+
+    soup = BeautifulSoup(html, 'html.parser')
+    row, errors = {}, []
+    for name, fn, empty in (('header', crawl_header, empty_header),
+                            ('program', crawl_program, empty_program),
+                            ('contact', crawl_contact, empty_contact),
+                            ('meta', crawl_meta, empty_meta)):
+        try:
+            row.update(fn(soup))
+        except Exception as e:                                   # noqa: BLE001
+            row.update(empty())
+            errors.append(name)
+            log(f'    section "{name}" failed: {e}')
+    row['has_license_number'] = 1 if row.get('license_number') else 0
+    return row, (';'.join(errors) or None)
+
+
+def crawler(seed_csv=SEED_CSV, output_csv=OUT_CSV, limit=None, resume=True):
+    seed = load_seed(seed_csv)
+    done = load_completed(output_csv) if resume else set()
+    todo = seed[~seed['slug'].isin(done)] if done else seed
+    if limit:
+        todo = todo.head(int(limit))
+
+    log(f'Seed: {len(seed)} facilities | already done: {len(done)} | '
+        f'this run: {len(todo)}')
+
+    session = requests.Session()
+    session.headers.update({'User-Agent': UA})
+
+    rated = unrated = no_license = failed = 0
+    for i, rec in enumerate(todo.itertuples(index=False), 1):
+        url = rec.facility_url
+        try:
+            row, errors = crawl_one(url, session)
+            if row is None:
+                log(f'[{i}/{len(todo)}] 404 {rec.slug}')
+                failed += 1
+                continue
+            row['slug'] = rec.slug
+            row['facility_url'] = url
+            row['errors'] = errors
+            append_row(row, output_csv)
+
+            if row.get('step_rating'):
+                rated += 1
+            else:
+                unrated += 1
+            if not row.get('license_number'):
+                no_license += 1
+
+            log(f'[{i}/{len(todo)}] {rec.slug} | '
+                f'step={row.get("step_rating") or "-"} '
+                f'lic={row.get("license_number") or "-"} '
+                f'type={row.get("program_type") or "-"}'
+                + (f' | errors={errors}' if errors else ''))
+        except Exception as e:                                   # noqa: BLE001
+            failed += 1
+            log(f'[{i}/{len(todo)}] FAILED {rec.slug}: {e}')
+
+        time.sleep(random.uniform(*DELAY_RANGE))
+
+    log(f'\nDone. rated={rated} unrated={unrated} '
+        f'no_license_number={no_license} failed={failed} -> {output_csv}')
+
+
+
+def attach_licensing(seed_csv=SEED_CSV, output_csv=OUT_CSV):
+    """Fold the DHHS licensing roster into the crawled rows, one pass, in place.
+
+    The finder pages carry the rating but almost nothing about the licence
+    itself; the roster carries capacity, age range, opening hours and the issue
+    date but no rating. Both halves live in the seed, tagged by `seed_source`,
+    so the join needs no extra file.
+
+    LEFT, not inner: the finder is the source of truth for which providers
+    exist, and a licence number that is not on the current monthly roster --
+    a new or recently-closed site -- must keep its rating and simply carry
+    empty licensing columns.
+    """
+    seed = pd.read_csv(seed_csv, dtype=str, keep_default_na=False, low_memory=False)
+    roster = seed[seed['seed_source'] == 'dhhs_roster'].drop(columns=['seed_source'])
+    roster = roster.loc[:, [c for c in roster.columns
+                            if roster[c].astype(str).str.strip().ne('').any()]]
+
+    # One row per licence. The roster occasionally repeats a number across
+    # monthly snapshots; the first occurrence is the current one.
+    roster['License_Number'] = (roster['License_Number'].astype(str).str.strip()
+                                .str.replace(r'\.0$', '', regex=True).str.upper())
+    roster = roster.drop_duplicates(subset='License_Number', keep='first')
+    roster = roster.rename(columns={c: f'dhhs_{_slug(c)}' for c in roster.columns})
+
+    records = pd.read_csv(output_csv, dtype=str, keep_default_na=False,
+                          low_memory=False)
+    key = records['license_number'].astype('string').str.strip().str.upper()
+    merged = (records.assign(_key=key)
+                     .merge(roster, how='left',
+                            left_on='_key', right_on='dhhs_license_number')
+                     .drop(columns=['_key']))
+    if len(merged) != len(records):
+        raise ValueError(f'join changed the row count: {len(records)} -> {len(merged)}')
+
+    merged.to_csv(output_csv, index=False)
+    matched = int(merged['dhhs_license_type'].notna().sum())
+    log(f'licensing join: {matched}/{len(merged)} rows matched the roster; '
+        f'{records.shape[1]} -> {merged.shape[1]} columns')
+
+
+def _slug(text):
+    text = str(text).strip().lower().replace('&', ' and ')
+    return re.sub(r'[^a-z0-9]+', '_', text).strip('_')
+
+
+if __name__ == '__main__':
+    ap = argparse.ArgumentParser(description='Crawl NE Step Up to Quality provider pages.')
+    ap.add_argument('--seed', default=SEED_CSV)
+    ap.add_argument('--output', default=OUT_CSV)
+    ap.add_argument('--limit', type=int, default=None,
+                    help='Only crawl the first N not-yet-done facilities (smoke test).')
+    ap.add_argument('--no-resume', action='store_true',
+                    help='Ignore rows already present in the output CSV.')
+    ap.add_argument('--fresh-log', action='store_true')
+    ap.add_argument('--join-only', action='store_true',
+                    help='Skip the crawl; only fold the DHHS roster into an '
+                         'existing records CSV. Run once after a full crawl.')
+    args = ap.parse_args()
+
+    if args.fresh_log:
+        create_log_file()
+    if args.join_only:
+        attach_licensing(seed_csv=args.seed, output_csv=args.output)
+    else:
+        crawler(seed_csv=args.seed, output_csv=args.output, limit=args.limit,
+                resume=not args.no_resume)
+        attach_licensing(seed_csv=args.seed, output_csv=args.output)

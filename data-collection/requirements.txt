@@ -1,0 +1,40 @@
+# CCQ — Child Care Quality Ratings
+#
+# Python 3.10+ (developed and tested on 3.12).
+#
+#     python -m venv .venv && source .venv/bin/activate
+#     pip install -r requirements.txt
+#     playwright install chromium        # only for the browser-driven states
+#
+# Versions are pinned rather than floored on purpose. pandas decides how values
+# are rendered on write and how they are inferred on read, so a different minor
+# version can change cell formatting (200 vs 200.0) in the output CSVs without
+# changing a single line of this code. If you are reproducing the published
+# dataset, install exactly these.
+
+pandas==3.0.2
+numpy==2.4.4
+requests==2.34.2
+beautifulsoup4==4.14.3
+
+# Phase 1 only, and only for the states whose sites will not render without a
+# real browser: CA, CO, GA, KY, NC, WI. Needs `playwright install chromium`
+# after pip. The other six states are plain HTTP and do not need this.
+playwright==1.59.0
+
+# ---------------------------------------------------------------------------
+# Optional
+# ---------------------------------------------------------------------------
+# sc_tls_probe.py — diagnoses South Carolina's TLS handshake, which is fussy
+# about ciphers on some machines. Only needed if sc_crawler.py fails to connect.
+#
+# httpx==0.28.1
+# curl_cffi==0.15.0
+#
+# ca_data_analysis.py — a one-off inspection helper, not part of the pipeline.
+#
+# matplotlib
+# scikit-learn
+
+# BeautifulSoup is only ever called with the stdlib 'html.parser', so lxml and
+# html5lib are deliberately absent.

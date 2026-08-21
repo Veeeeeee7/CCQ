@@ -1,0 +1,23 @@
+{
+  "raw": [
+    "provider_id",
+    "qr_rating",
+    "regulation_type",
+    "vacancies_count",
+    "vacancies_age_range",
+    "has_waitlist",
+    "waitlist_total",
+    "waitlist_last_updated"
+  ],
+  "full": [
+    "provider_id",
+    "qr_rating",
+    "num_violations",
+    "num_distinct_violation_rules",
+    "num_monitoring_visits",
+    "num_enforcement_actions",
+    "vacancies_count",
+    "has_waitlist",
+    "waitlist_total"
+  ]
+}

@@ -1,0 +1,30 @@
+{
+  "full": [
+    "provider_id",
+    "qr_rating",
+    "licensed_capacity",
+    "num_visits",
+    "age_min",
+    "age_max",
+    "license_age_days",
+    "visits_count",
+    "violations_count"
+  ],
+  "raw": [
+    "provider_id",
+    "qr_rating",
+    "facility_type",
+    "licensed_capacity",
+    "num_visits",
+    "ages_served",
+    "age_min",
+    "age_max",
+    "license_issue_date",
+    "license_age_days",
+    "license_restrictions",
+    "special_features",
+    "visits_date",
+    "visits_announced",
+    "violations_text"
+  ]
+}

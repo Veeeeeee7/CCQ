@@ -1,0 +1,28 @@
+{
+  "raw": [
+    "provider_id",
+    "qr_rating",
+    "permit_type",
+    "facility_type",
+    "county",
+    "city",
+    "zip",
+    "capacity",
+    "last_inspection_date",
+    "head_start",
+    "first_steps",
+    "breastfeeding_friendly",
+    "sleep_safe"
+  ],
+  "full": [
+    "provider_id",
+    "qr_rating",
+    "capacity",
+    "days_since_inspection",
+    "has_inspection",
+    "head_start",
+    "first_steps",
+    "breastfeeding_friendly",
+    "sleep_safe"
+  ]
+}

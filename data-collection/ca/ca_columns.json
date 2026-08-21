@@ -1,0 +1,39 @@
+{
+    "full": [
+        "provider_id",
+        "qr_rating",
+        "special_needs_experience",
+        "has_accreditation",
+        "openings_capacity",
+        "has_immediate_openings",
+        "days_open",
+        "earliest_open",
+        "latest_close",
+        "weekly_hours",
+        "min_age_months",
+        "max_age_months"
+    ],
+    "raw": [
+        "provider_id",
+        "qr_rating",
+        "special_needs_experience",
+        "has_accreditation",
+        "tags",
+        "openings_capacity",
+        "openings_status",
+        "has_immediate_openings",
+        "openings_age_label",
+        "business_hours",
+        "days_open",
+        "earliest_open",
+        "latest_close",
+        "weekly_hours",
+        "basics_language",
+        "basics_schedule",
+        "basics_meals",
+        "basics_subsidies_accepted",
+        "age_range",
+        "min_age_months",
+        "max_age_months"
+    ]
+}

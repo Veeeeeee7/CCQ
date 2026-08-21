@@ -1,0 +1,23 @@
+{
+  "raw": [
+    "provider_id",
+    "qr_rating",
+    "program_name",
+    "city",
+    "county",
+    "program_type",
+    "provider_type",
+    "ccrr_region",
+    "zip_code",
+    "latitude",
+    "longitude",
+    "provider_id_source"
+  ],
+  "full": [
+    "provider_id",
+    "qr_rating",
+    "has_license",
+    "latitude",
+    "longitude"
+  ]
+}

@@ -1,0 +1,41 @@
+{
+  "raw": [
+    "provider_id",
+    "qr_rating",
+    "facility_type",
+    "hours_monday",
+    "hours_tuesday",
+    "hours_wednesday",
+    "hours_thursday",
+    "hours_friday",
+    "hours_saturday",
+    "hours_sunday",
+    "days_open",
+    "earliest_open",
+    "latest_close",
+    "weekly_hours",
+    "total_capacity",
+    "n_monitoring_visits",
+    "n_visits_with_noncompliance",
+    "avg_compliance_pct",
+    "monitoring_section_text",
+    "has_substantiated_complaints",
+    "complaints_since_date",
+    "n_complaint_findings",
+    "complaints_section_text"
+  ],
+  "full": [
+    "provider_id",
+    "qr_rating",
+    "days_open",
+    "earliest_open",
+    "latest_close",
+    "weekly_hours",
+    "total_capacity",
+    "n_monitoring_visits",
+    "n_visits_with_noncompliance",
+    "avg_compliance_pct",
+    "has_substantiated_complaints",
+    "n_complaint_findings"
+  ]
+}
