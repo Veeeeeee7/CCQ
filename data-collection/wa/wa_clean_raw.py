@@ -10,15 +10,18 @@ LOG_FILE = 'wa_cleaning_log_raw.txt'
 KEY = 'provider_id'   # Salesforce `Id` is renamed to provider_id in finalize
 TARGET = 'qr_rating'  # Early_Achiever_Status_Internal__c -> qr_rating in finalize
 
-# Only these Early Achievers levels are valid scores. Level 3+ (the streamlined
-# Level 3 pathway) is collapsed to 3 by normalize_rating(); every non-rating
-# status (Not Enrolled, Withdrawn, Rating Expired, ...) becomes NaN and is
-# dropped by finalize(). There is no Level 1 — Level 1 is simply being licensed.
+# Level 3+ collapses to 3 and non-rating statuses become NaN (normalize_rating).
+# There is no Level 1 — Level 1 is simply being licensed.
 VALID_RATINGS = (2, 3, 4, 5)
 
 # Discovered-at-runtime column families retained by finalize().
 DYNAMIC_PREFIXES = ('agegroup_', 'slotavail_', 'spec_', 'language_', 'langinstr_',
                     'complaints_', 'inspections_', 'licensehist_', 'contacts_')
+
+# Decomposed from license_history_json by the privacy block, but set on 3,155
+# and 3,156 of the 3,168 released rows, so they carry no information.
+CONSTANT_COLS = ['licensehist_license_type_non_expiring',
+                 'licensehist_regulation_type_dcyf_licensed']
 
 
 def create_log_file(path=LOG_FILE):
@@ -37,8 +40,8 @@ def log(message, file=LOG_FILE):
 
 
 def strip_dollar_prefix(series):
-    """Remove leading '$' and comma separators from currency strings; everything
-    else is untouched. Kept for parity with the GA pipeline; no-op on WA today."""
+    """Remove leading '$' and comma separators from currency strings. Kept for
+    parity with the GA pipeline; no-op on WA."""
     def _clean(x):
         if isinstance(x, str) and x.startswith('$'):
             return x.replace('$', '').replace(',', '')
@@ -58,8 +61,7 @@ if __name__ == "__main__":
     # The target mixes levels with non-rating statuses; reduce it to a number.
     df = u.normalize_rating(df, log=log)
 
-    # Feature columns are renamed inside finalize(), so the parsers below read
-    # the native crawler names and write their tidy outputs.
+    # Renamed up front so the parsers below read the tidy names.
     df = df.rename(columns=u.FEATURE_RENAME)
 
     # Structured text fields -> their decomposed parts, text preserved.
@@ -70,7 +72,7 @@ if __name__ == "__main__":
     df = u.parse_license_dates(df)
 
     # Multi-value text -> one text column per discovered item (the phrase where
-    # present, else NaN). Schema is discovered from the data, not hardcoded.
+    # present, else NaN).
     df, _ = u.build_multivalue_columns(
         df, 'age_groups_served', delimiter=';', prefix='agegroup', as_bool=False)
     df, _ = u.build_multivalue_columns(
@@ -89,11 +91,16 @@ if __name__ == "__main__":
     df, _ = u.build_json_key_columns(df, 'license_history_json', 'licensehist')
     df, _ = u.build_json_key_columns(df, 'contacts_json', 'contacts')
 
-    # Record counts accompany the decomposed text (the severity features are a
-    # full-set concern and are left out of the raw scaffold).
     df = u.json_counts(df)
+
+    # A blank *_count means the detail page was never seen: unknown, not zero.
+    df = u.mask_unknown_counts(df, log=log)
 
     df = u.finalize(df, COLUMNS_FILE, 'raw', KEY, TARGET, DYNAMIC_PREFIXES,
                     na_as_level=True, valid_target_values=VALID_RATINGS)
+    df = df.drop(columns=[c for c in CONSTANT_COLS if c in df.columns])
+
+    # Uses post-rename names, so it has to run after finalize().
+    df = u.cast_int_columns(df, log=log)
     df.to_csv(OUTPUT, index=False)
     log(f'rows={len(df)} cols={len(df.columns)} -> {OUTPUT}')

@@ -1,63 +1,34 @@
 """Shared cleaning utilities for the Maryland EXCELS provider pipeline.
 
-Mirrors wi_cleaning_utils.py's contract (build_multivalue_columns,
-build_categorical_onehot, finalize()) since MD's source is a clean tabular CSV
-export rather than nested JSON, so this is structurally closer to WI's shape
-than NC's or GA's DOM-scrape shape.
-
-Achievements/Accreditations have an open-ended, growing vocabulary (MSDE adds
-new accreditation bodies over time), so — same design rule as every reference
-state — both are DISCOVERED at runtime by splitting on '; ', never hardcoded
-from a sample. (Cross-checked against the live /api/fap/referencedata lookup
-during Phase 1: the 9 Achievement / 13 Accreditation types it lists are a
-superset of what's actually observed in this crawl, confirming the split is
-clean and nothing is being mis-parsed.)
+MD's source is a flat tabular CSV export, so this mirrors wi_cleaning_utils.py
+(build_multivalue_columns, build_categorical_onehot, finalize()).
+Achievements/Accreditations have an open-ended vocabulary, so both are
+discovered at runtime by splitting on '; ', never hardcoded.
 """
 import re
 
 import numpy as np
 import pandas as pd
 
-# =============================================================================
-# Identifier + target
-# =============================================================================
 ID_RENAME = {'Program ID': 'provider_id'}
-ID_COL = 'provider_id'
 
 TARGET_RENAME = {'Quality Rating': 'qr_rating'}
 
-# Maryland EXCELS is a 5-level BLOCK rating (confirmed in Phase 0 against the
-# Program Information/Structure sheets, and empirically: qr_rating equals
-# min(LIC, STF, ACR, DAP, ADM) — whichever of those are populated for the
-# program type — for 4,943 of 5,005 rated rows in the Phase 2 sample; the 62
-# exceptions are all Public Prekindergarten rows capped one level below that
-# min, so some additional unconfirmed rule applies there. Either way, nothing
-# outside 1-5 was observed.
+# Maryland EXCELS is a 5-level block rating: qr_rating is the minimum of the
+# populated area sub-scores (LIC/STF/ACR/DAP/ADM for licensed programs,
+# APV/TQF/AVR/DAP/ADM for public pre-K). The export leaves APV/TQF/AVR blank,
+# so min(LIC, STF, ACR, DAP, ADM) sits one level below qr_rating on some
+# pre-K rows. The sub-scores are rubric leakage and are never released.
 VALID_RATINGS = (1, 2, 3, 4, 5)
 
-# --- Columns dropped before assembling the schema ---------------------------
-# Three groups, none of which belong in a modelling feature set:
-#   crawl metadata   : _source_county/_fetched_at are crawler bookkeeping, not
-#                      site data (the native `County` column already carries
-#                      this; dropped as metadata, same as the other reasons).
-#   privacy/identifying: name, DBA, exact address, phone, website. Same
-#                      rationale NC/CA use for facility_name/address/phone
-#                      (contact PII, not a quality feature). `County` is
-#                      dropped too, matching NC's "coarse geography still
-#                      excluded per project decision" — flagged in the
-#                      handoff message since it's a real judgment call, easy
-#                      to reverse by removing it from this list.
-#   target leakage   : LIC/STF/ACR/DAP/ADM are the indicator sub-scores whose
-#                      minimum IS the qr_rating (see VALID_RATINGS note) —
-#                      the exact same kind of rubric-leakage NC's utils
-#                      excludes `star_components` for.
 NON_FEATURE_COLS = [
-    # crawl metadata
-    '_source_county', '_fetched_at',
-    # privacy / identifying
+    # collection metadata
+    '_source_county', '_fetched_at', '_ages_fetched_at',
+    # privacy / identifying, including all geography
     'Program Name', 'Doing Business As', 'Address', 'City', 'State', 'Zip',
     'Phone', 'Alternate Phone', 'Website', 'County',
-    # target leakage (rubric sub-scores; see VALID_RATINGS note above)
+    # target leakage (rubric sub-scores; APV/TQF/AVR listed in case a future
+    # export fills them)
     'LIC', 'STF', 'ACR', 'APV', 'TQF', 'AVR', 'DAP', 'ADM',
 ]
 
@@ -69,10 +40,11 @@ def slug(text):
 
 
 def yesno_bool(series):
-    """'Yes'/'No'/blank -> True/False/NaN. Used for Scholarship Eligible and
-    the enrollment-availability age-band flags, none of which have a text
-    nuance worth preserving beyond presence/absence — same treatment WI gives
-    has_waitlist in both its raw and full sets."""
+    """'Yes'/'No'/blank -> True/False/NaN, in both raw and full.
+
+    Blank means not reported: Enrollment Availability is 'Yes' or blank, and
+    the licensed age flags are blank for a program that publishes no Licensed
+    Age Ranges card (every Public Prekindergarten) or an unmatched row."""
     def _one(v):
         if not isinstance(v, str) or not v.strip():
             return np.nan
@@ -82,7 +54,9 @@ def yesno_bool(series):
         if v == 'no':
             return False
         return np.nan
-    return series.map(_one)
+    # Nullable boolean: a plain .map() returns object dtype as soon as one
+    # cell is NaN, which full's numeric/boolean check would reject.
+    return series.map(_one).astype('boolean')
 
 
 def _row_items(value, delimiter, strip_prefix=None, strip_suffix=None,
@@ -157,23 +131,20 @@ def build_categorical_onehot(df, column, prefix, skip_values=()):
 
 def finalize(df, columns_file, which, key, target, dynamic_prefixes,
              na_as_level=False, valid_target_values=None):
-    """Shared tail — identical contract to wi_cleaning_utils.finalize().
+    """Shared tail — same contract as wi_cleaning_utils.finalize().
 
     na_as_level: True (raw) treats NaN as its own level, so a sparsely-present
     decomposed column survives even if its one non-null value never varies.
     False (full) drops all-NaN/constant columns strictly.
 
-    valid_target_values: None (complete set) keeps every row including
-    unrated/invalid; an iterable (e.g. VALID_RATINGS) keeps only rows whose
-    target, coerced to numeric, is one of those values — this is the whole
-    difference between a "standard" and "complete" script.
+    valid_target_values: None (complete set) keeps every row; an iterable
+    keeps only rows whose numeric target is one of those values.
     """
     df = df.rename(columns={**ID_RENAME, **TARGET_RENAME})
     df = df.drop(columns=[c for c in NON_FEATURE_COLS if c in df.columns])
 
-    # P1 / P2: direct identifiers, per-provider narratives and coordinates.
-    # Dropped BEFORE the scaffold reindex so they cannot survive even if a
-    # stale md_columns.json still lists them.
+    # Direct identifiers and coordinates are dropped before the scaffold
+    # reindex, so they cannot survive even if md_columns.json lists them.
     df = drop_identifier_columns(df)
 
     import json
@@ -184,23 +155,15 @@ def finalize(df, columns_file, which, key, target, dynamic_prefixes,
     df = df.reindex(columns=expected)
 
     df = df.drop_duplicates(subset=[key], keep='first')
-    # Coerce the target to numeric and ASSIGN IT BACK (not just used for a
-    # filter mask) so qr_rating is a genuine numeric column in the output,
-    # not a leftover digit-string from the all-string CSV read. (WI's
-    # original finalize() only used the coerced version for the filter and
-    # never re-assigned it — harmless for raw, but violates "full must be
-    # entirely numeric" for full/complete_full, per Phase 4's checklist.)
+    # Assigned back, so qr_rating is numeric rather than the all-string read.
     numeric_target = pd.to_numeric(df[target], errors='coerce')
     if valid_target_values is not None:
         keep = numeric_target.isin(list(valid_target_values))
         df, numeric_target = df[keep], numeric_target[keep]
     df[target] = numeric_target.astype('Int64')
 
-    # P2 / P3: geography (collapse -> relabel -> one-hot) and the
-    # k-anonymity sweep. These run HERE, after the dedup and the target filter,
-    # because k is a property of the rows that actually ship -- computing it
-    # before the filter would let a category that is thin in the release pass
-    # on the strength of rows that were about to be dropped.
+    # The k-anonymity sweep runs after the dedup and the target filter,
+    # because k is a property of the rows that actually ship.
     df = apply_privacy_remediation(df, which)
 
     cols_to_drop = []
@@ -212,11 +175,7 @@ def finalize(df, columns_file, which, key, target, dynamic_prefixes,
     return df.drop(columns=cols_to_drop)
 
 
-# >>> BEGIN GENERATED PRIVACY BLOCK -- do not edit here >>>
-# Generated from docs/2026-08-06/privacy_block.py by
-# docs/2026-08-06/sync_privacy_block.py. Edit the canonical file, not
-# this copy -- `sync_privacy_block.py --check` fails on drift.
-
+# >>> BEGIN PRIVACY BLOCK (shared verbatim by all 12 states) >>>
 import json as _json
 import random as _random
 import re as _re
@@ -225,30 +184,19 @@ from pathlib import Path as _Path
 import numpy as _np
 import pandas as _pd
 
-# --- per-state (rewritten by sync_privacy_block.py) --------------------------
+# --- per-state ----------------------------------------------------------------
 STATE = "md"
 
-# Small-range integer counts to top-code. These are exempt from the categorical
-# rules under the "continuous measure" scope decision, but a 7-level count is
-# not really continuous: wa:num_contacts ran {2: 2643, 3: 285, 1: 111, 4: 82,
-# 0: 28, 5: 18, 6: 1} and the single provider with six contacts was uniquely
-# identified. Capping folds it into a group of 19 at no modelling cost, since a
-# tree splitting on ">= 5" sees the same thing either way.
+# Small-range integer counts capped so a lone provider at the top of the range
+# joins the bucket below; lossless for a tree splitting on ">= cap".
 TOPCODE_COLS = {}
 
-# Column families whose members are LEVELS of one attribute (built by the
-# multi-value / one-hot / keyterm builders), so a rare member can be merged
-# into a shared "<prefix>other" bucket without inventing a nonsense feature.
-#
-# Deliberately NOT included: prefixes that merely share a first token but whose
-# members are distinct ATTRIBUTES -- has_*, num_*, and the JSON-derived
-# violations_* / monitoring_* / complaints_* / licensehist_* families. OR-ing
-# `violations_description` into `violations_other` would be exactly as wrong as
-# OR-ing `has_phone` into `has_other`. Rare members of those families fall
-# through to the free-text rule instead.
+# Families whose members are LEVELS of one attribute, so a rare member can be
+# merged into "<prefix>other". Prefixes whose members are distinct attributes
+# (has_*, num_*, violations_*, monitoring_*, ...) are deliberately excluded:
+# OR-ing them together would invent a meaningless feature.
 LEVEL_FAMILY_PREFIXES = ('accreditation_', 'achievement_', 'enrollment_', 'program_')
 
-# Never touched by any rule below.
 PROTECTED_COLS = ("provider_id", "qr_rating")
 # -----------------------------------------------------------------------------
 
@@ -257,78 +205,56 @@ MAX_LEVELS = 50       # cap on columns emitted when decomposing a list column
 OTHER_LABEL = "other"
 MULTIVALUE_DELIM = "|"
 
-# Geography collapses at a HIGHER floor than everything else (decision
-# 2026-08-06). k=5 is the bare privacy threshold and a county holding exactly 5
-# providers is near-isolating once combined with anything else -- but the
-# binding argument is modelling, not privacy: ~100 near-empty geographic
-# one-hots per state raise the SHAP shadow-feature noise floor and diffuse
-# attribution (GA's top 10 carried 31% of attribution across 412 features
-# versus MD's 93% across 26). The precedent is GA's region_* buckets, which hold
-# 417-527 providers each and are the only geographic features that cleared the
-# noise floor.
-GEO_K_ANON = 20
+GEO_K_ANON = K_ANON
 
-# Values that pandas' read_csv turns back into NaN. A cell holding one of these
-# exactly is written to CSV verbatim and reloads as missing, producing a column
-# that looks 100% null on read-back -- which is how co/raw:need_none shipped as
-# a phantom empty column while holding a real value for 15 providers.
+# Released geography is region-scale only: `region` always ships where a state
+# has one; `county` only where there is no region; city, ZIP and school
+# district never ship.
+GEO_ALWAYS_KEEP = ("region",)
+GEO_KEEP_IF_NO_REGION = ("county",)
+
+# Values that read_csv turns back into NaN; a cell holding one of these exactly
+# would reload as missing.
 _NA_TOKENS = {
     "#N/A", "#N/A N/A", "#NA", "-1.#IND", "-1.#QNAN", "-NaN", "-nan",
     "1.#IND", "1.#QNAN", "<NA>", "N/A", "NA", "NULL", "NaN", "None",
     "n/a", "nan", "null", "none_",
 }
 
-# A cell counts as date-like on a loose pattern rather than a strict parse:
-# the states use m/d/Y, Y-m-d and d-m-Y interchangeably and we only need to
-# know "this column is a clock", not what the clock says.
+# Loose on purpose: states mix m/d/Y, Y-m-d and d-m-Y, and we only need to
+# know that a column holds dates.
 _DATE_RE = _re.compile(r"\d{1,4}[-/]\d{1,2}[-/]\d{2,4}")
 
-# Private store for the two mappings that must NOT ship with the release: the
-# provider_id surrogate map and the geographic label map. Gitignored.
-_PRIVATE_DIR = _Path(__file__).resolve().parent.parent / "private"
+# Private store for the geographic label map, which must not ship. Gitignored.
+_PRIVATE_DIR = _Path(__file__).resolve().parent.parent / "data-private"
 
-# --- P1: direct and near-direct identifiers ----------------------------------
-# Dropped from EVERY state, not only the one that produces them, so a column
-# reintroduced by a future crawler change cannot silently ship. This mirrors
-# the PII_COLS tripwire that guards load_data() in the modelling repo.
-#
-# The narrative columns are here for the same reason as the obvious ones: at a
-# uniqueness ratio of 0.93-1.00 the prose IS the identifier, and regex-scrubbing
-# names and phone numbers out of a 22,000-character field is not reliable.
+# Direct identifiers, dropped from every state so a column reintroduced
+# upstream cannot silently ship. The narratives are near-unique per provider
+# and embed names, phones and addresses, so the prose itself identifies.
 PII_COLS = (
-    # CO -- inspection / complaint / injury narratives (uniq 0.97, phone hits
-    # x500, embedded street addresses) and the on-site licence number.
-    # adverse_actions_text was NOT in the audit's P1 list; the gate-2 pattern
-    # scan caught 3,338 phone-number hits in it after the first remediation
-    # pass, so it is the same class of column and is dropped with its siblings.
+    # CO -- inspection / complaint / injury / adverse-action narratives and the
+    # on-site licence number.
     "complaints_text", "injury_investigations_text", "inspection_report_text",
     "stage_ii_text", "adverse_actions_text", "license_number_on_site",
     # MT -- the program's trading name.
     "program_name",
-    # NC -- 22,299-character violation narratives (person names, phones,
-    # street addresses).
+    # NC -- violation narratives.
     "violations_text",
     # OK -- monitoring narrative, the per-provider report URL (itself a
     # registry key), and the per-visit compliance vector.
     "monitoring_areas_compliant", "monitoring_report_url",
     "monitoring_section_text",
-    # WA -- the contact block: 3,060 distinct real people's names, plus
-    # emails, phones, per-provider websites and the licence-history key.
+    # WA -- contact names, emails, phones, websites and the licence-history key.
     "contact_email", "contact_phone", "contact_website",
     "contacts_email", "contacts_full_name", "contacts_phone",
     "licensehist_license_id",
 )
 
-# --- P2: coordinates ---------------------------------------------------------
-# Removed outright. No rounding, no centroid substitute: at provider density
-# these locate a building, and a tree can memorise with them (they ranked
-# #2-#4 in the MT and KY SHAP results, which is the problem, not the defence).
+# Removed outright: at provider density coordinates locate a building.
 COORD_COLS = ("latitude", "longitude")
 
-# --- P2: geography routed through collapse -> relabel -> one-hot -------------
-# Matched by exact name so that look-alikes are not caught by accident:
-# CO's `school_district_operated_program` is a boolean about governance, not a
-# district identifier, and must NOT be pseudonymised.
+# Matched by exact name so look-alikes are not caught: CO's
+# `school_district_operated_program` is a governance flag, not a district.
 GEO_LABEL_COLS = (
     "zip", "zip_code", "zipcode", "location_zip", "socrata_physicalzip",
     "county", "dhhs_county",
@@ -336,27 +262,16 @@ GEO_LABEL_COLS = (
     "school_district", "district", "region", "ccrr_region",
 )
 
-# Geographic families that the clean_full scripts one-hot BEFORE finalize runs
-# (CO/KY/MT/NE/SC ship county_* this way). These are gathered back into a
-# single series, put through the same pipeline, and re-emitted.
+# Geographic families one-hot encoded before finalize runs; gathered back into
+# a single series, put through the same pipeline, and re-emitted.
 GEO_ONEHOT_PREFIXES = ("county_", "city_", "region_", "district_")
 
-# Which geographic fields are one-hotted into `full`. COARSE fields only:
-# county- and region-level. City, ZIP and school district stay as label columns
-# in `raw` and are dropped from `full`, because one-hotting them would add
-# hundreds of near-empty booleans (KY alone has 268 surviving zip and city
-# labels) for granularity no tree can use. This rule was implicit in the first
-# pass -- it happened to hold because the clean_full scripts only ever carried
-# county forward -- and is now enforced rather than incidental.
+# Coarse fields only are one-hot encoded into `full`.
 GEO_FULL_FIELDS = ("county", "dhhs_county", "region", "ccrr_region", "district")
 
-# Source columns that mean the same thing under different names, normalised so
-# a field lands as `geo_county` / `geo_region` in every state and both views.
-# Without this MT emits `geo_ccrr_region` in raw against `geo_region_*` in full,
-# and NE emits `geo_dhhs_county` against everyone else's `geo_county`.
-# WA's location_city/socrata_physicalcity (and the matching zip pair) are NOT
-# aliased: they are two genuinely different source columns and collapsing them
-# to one name would silently drop one.
+# Same field under different names, so it lands as geo_county / geo_region in
+# every state and both views. WA's location_*/socrata_* pairs are genuinely
+# different sources and are not aliased.
 GEO_FIELD_ALIASES = {
     "ccrr_region": "region",
     "dhhs_county": "county",
@@ -364,25 +279,12 @@ GEO_FIELD_ALIASES = {
     "zipcode": "zip",
 }
 
-# Geographic fields NOT pseudonymised. `region` is coarse by construction --
-# GA's six regions hold 417-527 providers each and MT's seven are CCR&R service
-# areas -- so it identifies nobody on its own, and keeping it readable means the
-# paper can report "region_SE cleared the noise floor" without reaching for the
-# private map. Everything else is relabelled.
+# Coarse enough to identify nobody, so kept readable rather than relabelled.
 GEO_READABLE = ("region", "ccrr_region")
 
 
-# =============================================================================
-# small helpers
-# =============================================================================
 def _privacy_log(message, state=None):
-    """Append to {state}_privacy_log.txt next to the state's utils and print.
-
-    Deliberately independent of each state's own logger: the four reference
-    states use three different logging signatures (plain callable, ParseLog
-    with .warn, and CA's three-argument make_logger) and this block has to drop
-    into all of them unchanged.
-    """
+    """Append to {state}_privacy_log.txt next to the utils module and print."""
     state = state or STATE
     path = _Path(__file__).resolve().parent / f"{state}_privacy_log.txt"
     try:
@@ -400,12 +302,8 @@ def _privacy_slug(text):
 
 
 def _is_boolish(series):
-    """True for a column whose non-null values are only true/false-like.
-
-    Covers the four shapes a boolean survives a CSV round-trip as: real bools,
-    nullable booleans, 0/1 ints (finalize casts full's booleans to Int64) and
-    the 'True'/'False' strings you get back from a plain read_csv.
-    """
+    """True if the non-null values are only bools, 0/1 or 'True'/'False'
+    (the shapes a boolean takes after a CSV round-trip)."""
     values = series.dropna()
     if values.empty:
         return False
@@ -414,8 +312,8 @@ def _is_boolish(series):
 
 
 def _positive_mask(series):
-    """Row mask for 'this flag is set', for either a boolean or a raw-style
-    text level column (which holds the item phrase where present, else NaN)."""
+    """Row mask for 'this flag is set', for a boolean or a raw-style level
+    column (item text where present, else NaN)."""
     if _is_boolish(series):
         return series.map({True: True, False: False, 1: True, 0: False,
                            1.0: True, 0.0: False,
@@ -428,23 +326,16 @@ def _positives(series):
 
 
 def _is_level_column(series):
-    """The structural signature of a one-hot / presence LEVEL column: boolean
-    (the `full` shape), or exactly one distinct non-null value with NaN
-    elsewhere (what build_multivalue_columns(as_bool=False) produces in `raw`).
-
-    Sharing a prefix is NOT sufficient. GA's `operating_` prefix covers both
-    operating_months_jan (a level) and operating_hours (a free categorical);
-    only the first can be folded into operating_other.
-    """
+    """Boolean, or exactly one distinct value with NaN elsewhere. A shared
+    prefix alone is not enough (GA's operating_hours vs operating_months_*)."""
     return _is_boolish(series) or (
         series.nunique(dropna=True) == 1 and series.isna().any())
 
 
 def _label_or_nan(mask, label=OTHER_LABEL):
-    """Object-dtype array holding `label` where mask is set, NaN elsewhere.
+    """Object array holding `label` where mask is set, NaN elsewhere.
 
-    np.where(mask, "other", np.nan) raises DTypePromotionError on numpy 2.x --
-    there is no common dtype for str and float -- so build the array explicitly.
+    np.where(mask, "other", np.nan) raises DTypePromotionError on numpy 2.x.
     """
     out = _np.empty(len(mask), dtype=object)
     out[:] = _np.nan
@@ -457,27 +348,16 @@ def _private_path(name):
     return _PRIVATE_DIR / name
 
 
-# =============================================================================
-# hygiene -- not privacy, but it runs here because this is the last hook before
-# finalize's all-NaN / constant drop, so a column emptied by a bad round-trip
-# still gets caught.
-# =============================================================================
 def neutralize_na_tokens(df, state=None):
-    """Rewrite cells that pandas' read_csv would turn back into NaN.
-
-    A cell holding exactly "None" (or NA / N/A / NULL / nan / null) is written
-    to CSV verbatim and reloads as missing, so the column reads as 100% null
-    even though it carries real values. That is how `co/raw:need_none` shipped
-    as a phantom empty column while actually flagging 15 providers.
-
-    Lowercasing escapes the token set for the cases that occur here ("None" ->
-    "none", which pandas does not treat as NA); anything still colliding after
-    that gets a trailing underscore.
-    """
+    """Rewrite cells that read_csv would turn back into NaN ("None" -> "none",
+    or a trailing underscore if still colliding)."""
     changed = []
     for column in df.columns:
         series = df[column]
-        if series.dtype != object:
+        # Not `dtype != object`: pandas 3 gives text columns the `str` dtype,
+        # which an object-only guard would silently skip.
+        if not (_pd.api.types.is_object_dtype(series)
+                or _pd.api.types.is_string_dtype(series)):
             continue
         hits = series.isin(_NA_TOKENS)
         if not hits.any():
@@ -498,8 +378,6 @@ def neutralize_na_tokens(df, state=None):
 
 
 def topcode_counts(df, state=None, columns=None):
-    """Cap the named small-range counts, so a lone provider at the top of the
-    range joins the bucket below instead of standing alone."""
     columns = TOPCODE_COLS if columns is None else columns
     for column, cap in columns.items():
         if column not in df.columns:
@@ -509,37 +387,25 @@ def topcode_counts(df, state=None, columns=None):
         if not above:
             continue
         df[column] = values.clip(upper=cap)
-        _privacy_log(f"[P4] {column}: top-coded at {cap} ({above} row(s) capped)",
+        _privacy_log(f"[topcode] {column}: top-coded at {cap} ({above} row(s) capped)",
                      state)
     return df
 
 
-# =============================================================================
-# P1 / P2 -- outright drops
-# =============================================================================
 def drop_identifier_columns(df, state=None, log=None):
-    """Drop the direct identifiers, the per-provider narratives and the
-    coordinates. Called EARLY -- before the scaffold reindex -- so that these
-    can never reach the output even if a scaffold still lists them."""
+    """Drop identifiers, narratives and coordinates. Called before the scaffold
+    reindex so they cannot reach the output even if a scaffold lists them."""
     targets = [c for c in df.columns
                if c in PII_COLS or c.lower() in COORD_COLS]
     if targets:
-        _privacy_log(f"[P1/P2] dropped {len(targets)} identifier/coordinate "
+        _privacy_log(f"[identifiers] dropped {len(targets)} identifier/coordinate "
                      f"column(s): {sorted(targets)}", state)
     return df.drop(columns=targets)
 
 
-# =============================================================================
-# P3 -- rare levels inside a one-hot / presence family
-# =============================================================================
 def collapse_rare_level_family(df, prefix, min_n=K_ANON, state=None):
-    """Levels held by fewer than min_n providers are OR-ed into <prefix>other
-    and their own columns removed.
-
-    Works for both views: in `full` a level is a boolean, in `raw` it is the
-    item phrase where present and NaN where not, so the merged bucket is
-    emitted in whichever of those two shapes the family already uses.
-    """
+    """OR levels held by fewer than min_n providers into <prefix>other, in the
+    shape (boolean or raw text) the family already uses."""
     other_col = prefix + OTHER_LABEL
     members = [c for c in df.columns
                if c.startswith(prefix) and c != other_col]
@@ -559,25 +425,21 @@ def collapse_rare_level_family(df, prefix, min_n=K_ANON, state=None):
 
     df = df.drop(columns=rare)
     df[other_col] = mask if as_bool else _label_or_nan(mask)
-    _privacy_log(f"[P3] {prefix}*: merged {len(rare)} level(s) with <{min_n} "
+    _privacy_log(f"[k-anon] {prefix}*: merged {len(rare)} level(s) with <{min_n} "
                  f"providers into {other_col} (n={int(mask.sum())})", state)
 
-    # A bucket that is itself thin cannot stand: it would re-isolate exactly
-    # the providers the merge was meant to hide.
+    # A thin bucket would re-isolate the providers the merge was meant to hide.
     if 0 < _positives(df[other_col]) < min_n:
-        _privacy_log(f"[P3] {other_col}: still <{min_n} after merging, dropped",
+        _privacy_log(f"[k-anon] {other_col}: still <{min_n} after merging, dropped",
                      state)
         df = df.drop(columns=[other_col])
     return df
 
 
-# =============================================================================
-# P3 -- rare values inside a single-valued categorical
-# =============================================================================
 def collapse_rare_values(series, min_n=K_ANON, other=OTHER_LABEL):
-    """Values held by fewer than min_n rows become `other`. Recomputed after
-    merging: if `other` is itself thin it is folded into the smallest surviving
-    group rather than left as a thin bucket of its own (spec 2.2 step 1)."""
+    """Values held by fewer than min_n rows become `other`; if `other` is itself
+    thin it is nulled. Folding it into another group would assert a value the
+    provider does not hold."""
     values = series.dropna().astype(str)
     counts = values.value_counts()
     rare = set(counts[counts < min_n].index)
@@ -587,41 +449,20 @@ def collapse_rare_values(series, min_n=K_ANON, other=OTHER_LABEL):
 
     recounted = out.dropna().astype(str).value_counts()
     if other in recounted.index and recounted[other] < min_n:
-        survivors = recounted.drop(index=[other])
-        if len(survivors):
-            smallest = survivors.idxmin()
-            out = out.where(out != other, smallest)
-        else:
-            out = _pd.Series([_np.nan] * len(series), index=series.index)
+        out = out.where(out.astype(str) != other, _np.nan)
     return out
 
 
-# =============================================================================
-# P3 -- free-text columns that cannot reach k>=5 as they stand
-# =============================================================================
 def classify_text_column(series, min_n=K_ANON):
-    """Decide how a text column that fails k>=min_n should be treated.
+    """Classify a text column that fails k>=min_n as one of:
 
-    Four outcomes, because these columns are three different problems wearing
-    the same dtype:
+      "date"   -- dates; the text copy is near-unique and dropped.
+      "list"   -- a pipe-joined list, unique only as a combination; decomposed
+                  into one column per common item.
+      "single" -- a categorical with a long tail; the tail is collapsed.
+      "prose"  -- per-provider narrative; dropped.
 
-      "date"   -- an administrative clock. Section 5 keeps clocks, but the raw
-                  text copy is near-unique and the full view already carries
-                  the numeric derivative (license_age_days, days_since_
-                  inspection, n_monitoring_visits), so the text column goes.
-      "list"   -- a pipe-joined event list. It is unique only as a COMBINATION;
-                  the underlying vocabulary is small (ky:inspection_
-                  inspectiontype has 417 distinct cells over 13 distinct
-                  items). Decomposing to one column per item drops uniqueness
-                  to the vocabulary and keeps the signal.
-      "single" -- an ordinary categorical with a long tail. Collapse the tail.
-      "prose"  -- per-provider narrative. The vocabulary is as large as the
-                  data, so no decomposition helps and the text itself is the
-                  fingerprint. Drop, same reasoning the spec applies to the P1
-                  narratives.
-
-    Returns (kind, kept_items). kept_items is the vocabulary that survives at
-    k>=min_n, most frequent first.
+    Returns (kind, kept_items), kept_items most frequent first.
     """
     values = series.dropna().astype(str)
     if values.empty:
@@ -645,8 +486,7 @@ def classify_text_column(series, min_n=K_ANON):
             if {p.strip() for p in cell.split(MULTIVALUE_DELIM)} & kept
         ) / len(values)
         if covered < 0.5:
-            # The common vocabulary explains less than half the rows, so what
-            # is left after collapsing is mostly "other" -- it is prose.
+            # Mostly "other" after collapsing, so treat it as prose.
             return "prose", []
         ordered = sorted(kept, key=lambda v: (-frequency[v], v))
         return "list", ordered
@@ -662,25 +502,35 @@ def classify_text_column(series, min_n=K_ANON):
 
 def remediate_text_column(df, column, min_n=K_ANON, max_levels=MAX_LEVELS,
                           state=None):
-    """Apply the classify_text_column verdict to one column."""
     kind, kept = classify_text_column(df[column], min_n)
 
     if kind in ("date", "prose"):
-        _privacy_log(f"[P3] {column}: dropped ({kind}, cannot reach k>={min_n})",
+        _privacy_log(f"[k-anon] {column}: dropped ({kind}, cannot reach k>={min_n})",
                      state)
         return df.drop(columns=[column])
 
     if kind == "single":
+        was_present = df[column].notna()
         df[column] = collapse_rare_values(df[column], min_n)
-        _privacy_log(f"[P3] {column}: collapsed tail into '{OTHER_LABEL}' "
-                     f"({len(kept)} value(s) kept)", state)
+        suppressed = int((df[column].isna() & was_present).sum())
+        blanks = int(df[column].isna().sum())
+        if suppressed and blanks < min_n and df[column].dropna().nunique() < 2:
+            # One value plus a blank set below the floor distinguishes only
+            # which providers were suppressed. Columns that still separate
+            # real groups, or whose blanks are mostly genuine missingness, are
+            # kept with the tail blanked.
+            _privacy_log(f"[k-anon] {column}: one surviving value and a blank set "
+                         f"of {blanks} (< {min_n}) after suppressing "
+                         f"{suppressed} row(s) -- dropped", state)
+            return df.drop(columns=[column])
+        _privacy_log(f"[k-anon] {column}: collapsed tail into '{OTHER_LABEL}' "
+                     f"({len(kept)} value(s) kept"
+                     f"{f', {suppressed} row(s) below the floor nulled' if suppressed else ''})",
+                     state)
         return df
 
-    # kind == "list": decompose into one text column per surviving item. The
-    # vocabulary is capped so that a long-tailed field (wi:violations_rule_
-    # number has 512 items at k>=5) cannot add hundreds of columns to the raw
-    # view -- the tail goes to <column>_other along with the sub-threshold
-    # items, which is the same bounded treatment geography gets.
+    # "list": one text column per surviving item, capped at max_levels; the
+    # tail and sub-threshold items go to <column>_other.
     emit = kept[:max_levels]
     tail = set(kept[max_levels:])
     cells = df[column].map(
@@ -700,13 +550,11 @@ def remediate_text_column(df, column, min_n=K_ANON, max_levels=MAX_LEVELS,
     has_other = [
         bool(items - emitted) if items else False for items in cells
     ]
-    # The tail bucket is subject to the same floor as everything else: if only
-    # a handful of providers land in it, it re-isolates exactly the providers
-    # the fold was meant to hide.
+    # A thin tail bucket would re-isolate the providers it was meant to hide.
     kept_other = sum(has_other) >= min_n
     if kept_other:
         df[other_col] = _label_or_nan(has_other)
-    _privacy_log(f"[P3] {column}: decomposed into {len(used)} item column(s)"
+    _privacy_log(f"[k-anon] {column}: decomposed into {len(used)} item column(s)"
                  f"{f' + {other_col}' if kept_other else ''} "
                  f"({len(tail)} tail item(s) folded"
                  f"{f', {sum(has_other)} row(s) below the floor dropped' if any(has_other) and not kept_other else ''})",
@@ -714,12 +562,8 @@ def remediate_text_column(df, column, min_n=K_ANON, max_levels=MAX_LEVELS,
     return df.drop(columns=[column])
 
 
-# =============================================================================
-# P2 -- geography: collapse -> relabel -> one-hot
-# =============================================================================
 def _gather_onehot_family(df, prefix):
-    """Reverse a pre-built one-hot family back into a single label series so it
-    can go through the same collapse/relabel pipeline as a text column."""
+    """Reverse a one-hot family back into a single label series."""
     members = [c for c in df.columns if c.startswith(prefix)]
     if len(members) < 2:
         return None, []
@@ -743,29 +587,12 @@ def _save_geo_map(state, mapping):
 
 
 def build_geo_features(df, which, state=None, min_n=GEO_K_ANON, log=None):
-    """Collapse -> relabel -> one-hot, in that order.
+    """Collapse -> relabel -> one-hot, in that order: collapsing defeats
+    isolation (no group smaller than min_n), relabelling defeats lookup.
 
-    Order matters and is not interchangeable: relabeling defeats LOOKUP (a
-    reader cannot turn geo_county_37 into a town) while collapsing defeats
-    ISOLATION (no surviving group is smaller than min_n). Relabeling alone
-    leaves every k=1 group intact, so the collapse has to come first --
-    otherwise the "other" bucket ends up defined over shuffled labels and is
-    much harder to verify.
-
-    Output shape differs by view, on purpose:
-      raw  -> ONE pseudonymous label column per geographic field, keeping the
-              text-preserving shape section 3 requires of raw. One-hotting here
-              would add ~1,255 boolean columns across the raw files and bury
-              the text serialization in false flags.
-      full -> one boolean per surviving label, matching how full encodes every
-              other categorical.
-    Both views collapse and relabel identically, so k>=min_n and the anti-lookup
-    property hold either way.
-
-    The real-value -> label mapping is written to private/ and never ships.
-    Without it the release is pseudonymised, not anonymised: an adversary
-    holding the public licensing registry can match providers on capacity,
-    facility type and violation counts and read the mapping off the matches.
+    raw gets one pseudonymous label column per field; full gets one boolean
+    per surviving label. The value -> label map is written to data-private/
+    and never ships.
     """
     state = state or STATE
     mapping = _load_geo_map(state)
@@ -775,8 +602,8 @@ def build_geo_features(df, which, state=None, min_n=GEO_K_ANON, log=None):
     for col in GEO_LABEL_COLS:
         if col in df.columns:
             name = GEO_FIELD_ALIASES.get(col, col)
-            # Only alias when the canonical name is still free, so WA's two
-            # city columns keep their own identities instead of overwriting.
+            # Alias only when the canonical name is free, so WA's two city
+            # columns do not overwrite each other.
             if name in seen:
                 name = col
             seen.add(name)
@@ -790,15 +617,25 @@ def build_geo_features(df, which, state=None, min_n=GEO_K_ANON, log=None):
             seen.add(name)
             sources.append((name, series, members))
 
+    # An all-empty region does not count, or the state would ship no geography.
+    has_region = any(name in GEO_ALWAYS_KEEP and not series.dropna().empty
+                     for name, series, _ in sources)
+
     for name, series, drop_cols in sources:
         values = series.dropna().astype(str)
         df = df.drop(columns=[c for c in drop_cols if c in df.columns])
         if values.empty:
             continue
 
-        # Fine-grained fields (city, ZIP, school district) are raw-only.
+        if name not in GEO_ALWAYS_KEEP and not (
+                name in GEO_KEEP_IF_NO_REGION and not has_region):
+            reason = ("superseded by region" if name in GEO_KEEP_IF_NO_REGION
+                      else "finer than region scale")
+            _privacy_log(f"[geo] {name}: dropped from {which} ({reason})", state)
+            continue
+
         if which == "full" and name not in GEO_FULL_FIELDS:
-            _privacy_log(f"[P2] {name}: fine-grained, not one-hotted into full",
+            _privacy_log(f"[geo] {name}: fine-grained, not one-hotted into full",
                          state)
             continue
 
@@ -806,42 +643,51 @@ def build_geo_features(df, which, state=None, min_n=GEO_K_ANON, log=None):
         collapsed = collapse_rare_values(series.astype(object), min_n)
         surviving = sorted(collapsed.dropna().astype(str).unique())
 
-        # 2. RELABEL -- integer labels drawn from a random permutation seeded
-        #    independently of the data. Reused across runs where the category
-        #    set is unchanged, so labels stay stable between regenerations.
-        #    Skipped for the coarse fields in GEO_READABLE.
+        # 2. RELABEL -- integer labels from a random permutation, reused across
+        #    runs so labels stay stable. Looked up on the slug, not the literal
+        #    value: raw sees "Denver" but full rebuilds "denver" from one-hot
+        #    column names, and both must get the same label.
         readable = name in GEO_READABLE
         if readable:
-            # Strip a redundant field-name prefix so WA's literal "Region 1"
-            # yields geo_region_1 rather than geo_region_region_1, matching MT.
+            # Strip a redundant field-name prefix ("Region 1" -> geo_region_1).
             def _label(value):
                 slug = _privacy_slug(value)
                 prefix = f"{name}_"
                 return slug[len(prefix):] if slug.startswith(prefix) else slug
             known = {v: _label(v) for v in surviving}
+            by_key = {_privacy_slug(v): lab for v, lab in known.items()}
         else:
             known = mapping.get(name, {})
-            unlabelled = [v for v in surviving if v not in known]
+            by_key = {}
+            for value, label in known.items():
+                by_key.setdefault(_privacy_slug(value), label)
+            unlabelled = [v for v in surviving if _privacy_slug(v) not in by_key]
             if unlabelled:
                 free = [i for i in range(len(surviving) + len(known))
                         if i not in set(known.values())]
                 rng.shuffle(free)
                 for value, label in zip(unlabelled, free):
                     known[value] = label
+                    by_key[_privacy_slug(value)] = label
                 mapping[name] = known
 
-        labels = collapsed.map(lambda v: known.get(str(v)) if _pd.notna(v) else None)
+        # Explicit object Series: .map() with missing values infers float64 and
+        # would render label 4 as "county_4.0".
+        labels = _pd.Series(
+            [by_key.get(_privacy_slug(v)) if _pd.notna(v) else None
+             for v in collapsed],
+            index=collapsed.index, dtype=object)
 
         # 3. ONE-HOT (full) or single label column (raw)
         if which == "full":
             for value in surviving:
-                label = known[value]
+                label = by_key[_privacy_slug(value)]
                 df[f"geo_{name}_{label}"] = (labels == label).fillna(False).to_numpy()
         else:
             df[f"geo_{name}"] = labels.map(
                 lambda v: f"{name}_{v}" if v is not None and _pd.notna(v) else _np.nan)
 
-        _privacy_log(f"[P2] {name}: {len(values.unique())} value(s) -> "
+        _privacy_log(f"[geo] {name}: {len(values.unique())} value(s) -> "
                      f"{len(surviving)} label(s) at k>={min_n} "
                      f"({'one-hot' if which == 'full' else 'label column'}"
                      f"{', readable' if readable else ''})", state)
@@ -851,16 +697,11 @@ def build_geo_features(df, which, state=None, min_n=GEO_K_ANON, log=None):
     return df
 
 
-# =============================================================================
-# the sweep
-# =============================================================================
 def enforce_k_anonymity(df, which, state=None, level_prefixes=None,
                         protect=PROTECTED_COLS, min_n=K_ANON,
                         max_levels=MAX_LEVELS):
-    """Every categorical value and every flag ends up shared by >= min_n
-    providers. Applied over the RELEASED rows, which is why finalize calls this
-    after the dedup and the target filter rather than before: k is a property
-    of the rows that ship, not of the rows that were scraped."""
+    """Every categorical value and flag ends up shared by >= min_n providers.
+    Run on the released rows, i.e. after dedup and the target filter."""
     state = state or STATE
     prefixes = LEVEL_FAMILY_PREFIXES if level_prefixes is None else level_prefixes
 
@@ -884,15 +725,11 @@ def enforce_k_anonymity(df, which, state=None, level_prefixes=None,
         if counts.min() >= min_n:
             continue
         if family_member(column) and _is_level_column(series):
-            # Step 1 already folded every thin level of this family, so a
-            # surviving level column is above the floor by construction.
+            # Already folded in step 1.
             continue
         df = remediate_text_column(df, column, min_n, max_levels, state)
 
-    # 3. flags outside any declared family that are set for < min_n providers.
-    #    There is no family bucket to merge them into, so they go; a flag true
-    #    for three providers is near-constant for modelling and isolating for
-    #    privacy, which is the worst trade in the dataset.
+    # 3. thin flags outside any family: nothing to merge into, so dropped.
     for column in [c for c in df.columns if c not in protect]:
         if column not in df.columns or not _is_boolish(df[column]):
             continue
@@ -900,16 +737,12 @@ def enforce_k_anonymity(df, which, state=None, level_prefixes=None,
             continue
         positives = _positives(df[column])
         if 0 < positives < min_n:
-            _privacy_log(f"[P3] {column}: flag set for {positives} provider(s), "
+            _privacy_log(f"[k-anon] {column}: flag set for {positives} provider(s), "
                          f"no family to merge into -- dropped", state)
             df = df.drop(columns=[column])
 
-    # 4. flags whose MINORITY class is below the floor, in either direction.
-    #    A boolean is k-anonymous at min(positives, negatives), not at
-    #    positives: wa/full:has_email was True for 3,167 of 3,168 providers, so
-    #    "the one WA provider with no email" was a unique identifier even though
-    #    step 3 saw 3,167 and waved it through. Applies to family members too,
-    #    since a level true for all-but-one isolates the exception.
+    # 4. flags whose minority class (True or False) is below the floor: a flag
+    #    true for all but one provider isolates that one.
     for column in [c for c in df.columns if c not in protect]:
         if column not in df.columns or not _is_boolish(df[column]):
             continue
@@ -918,7 +751,7 @@ def enforce_k_anonymity(df, which, state=None, level_prefixes=None,
         positives = int(mask.sum())
         minority = min(positives, present - positives)
         if 0 < minority < min_n:
-            _privacy_log(f"[P3] {column}: minority class is {minority} "
+            _privacy_log(f"[k-anon] {column}: minority class is {minority} "
                          f"provider(s) of {present} -- dropped", state)
             df = df.drop(columns=[column])
     return df
@@ -927,8 +760,8 @@ def enforce_k_anonymity(df, which, state=None, level_prefixes=None,
 def apply_privacy_remediation(df, which, state=None, level_prefixes=None,
                               protect=PROTECTED_COLS, min_n=K_ANON,
                               max_levels=MAX_LEVELS, log=None):
-    """Geography, then the k-anonymity sweep. Call from finalize() AFTER the
-    row filters; call drop_identifier_columns() BEFORE the scaffold reindex."""
+    """Geography, then the k-anonymity sweep. Call from finalize() after the
+    row filters; call drop_identifier_columns() before the scaffold reindex."""
     state = state or STATE
     order = list(df.columns)
     df = neutralize_na_tokens(df, state)
@@ -936,32 +769,10 @@ def apply_privacy_remediation(df, which, state=None, level_prefixes=None,
     df = build_geo_features(df, which, state, max(min_n, GEO_K_ANON), log)
     df = enforce_k_anonymity(df, which, state, level_prefixes, protect,
                              min_n, max_levels)
-    # Both steps append their output, so restore the scaffold's ordering for
-    # the survivors and park everything newly derived after it, sorted. This
-    # keeps provider_id and qr_rating first, which the release contract
-    # requires and the downstream loader assumes.
+    # Keep the scaffold order (provider_id, qr_rating first) and append newly
+    # derived columns after it, sorted.
     kept = [c for c in order if c in df.columns]
     added = sorted(c for c in df.columns if c not in order)
     return df[kept + added]
 
-
-def assert_k_anonymity(df, protect=PROTECTED_COLS, min_n=K_ANON):
-    """Gate 3, as an assertion the pipeline can run on itself."""
-    failures = []
-    for column in df.columns:
-        if column in protect:
-            continue
-        series = df[column]
-        if _is_boolish(series):
-            present = int(series.notna().sum())
-            positives = _positives(series)
-            minority = min(positives, present - positives)
-            if 0 < minority < min_n:
-                failures.append(f"{column} (minority class {minority})")
-        elif not _pd.api.types.is_numeric_dtype(series):
-            counts = series.dropna().astype(str).value_counts()
-            if len(counts) and counts.min() < min_n:
-                failures.append(f"{column} (min group {int(counts.min())})")
-    return failures
-
-# <<< END GENERATED PRIVACY BLOCK <<<
+# <<< END PRIVACY BLOCK <<<

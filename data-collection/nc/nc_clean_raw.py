@@ -1,15 +1,13 @@
 """
-clean_raw.py — Build the `raw` dataset (text preserved + maximally decomposed)
-for LLM-based methods from the NC DCDEE childcare scrape.
+nc_clean_raw.py — Build the `raw` dataset (text preserved + maximally
+decomposed) from the NC records, valid 1–5 ratings only.
 
-Same early steps and same row filtering as clean_full.py (so the two outputs
-are row-aligned and a single fold file applies to both), but the per-field
-builders run in "raw" mode: original text is kept, multi-value fields become
-per-item text columns, JSON becomes per-key joined text, and the prose scalar
-extractions are kept *alongside* the text.
+Same early steps and row filtering as nc_clean_full.py (so the two outputs are
+row-aligned), but the per-field builders run in "raw" mode: original text is
+kept, multi-value fields become per-item text columns, JSON becomes per-key
+joined text, and the prose scalar extractions are kept *alongside* the text.
 
-Run:
-    python clean_raw.py --input nc_records_sample.csv --output data/raw.csv
+    python nc_clean_raw.py
 """
 from __future__ import annotations
 
@@ -37,7 +35,7 @@ def main() -> None:
     print(f"[raw] loading {args.input}")
     df = pd.read_csv(args.input, low_memory=False, dtype=str)  # preserve leading zeros
 
-    # --- shared early steps (identical to full, keeps both row-aligned) ------
+    # --- shared early steps (identical in all four scripts) ------------------
     df = U.drop_error_rows(df, log)
     df = U.strip_dollars(df)
     U.check_grain_unique(df, U.ID_COL, log)

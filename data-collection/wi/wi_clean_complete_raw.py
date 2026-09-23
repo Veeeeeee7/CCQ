@@ -26,6 +26,11 @@ def strip_dollar_prefix(series):
 if __name__ == "__main__":
     df = pd.read_csv(INPUT, low_memory=False)
 
+    # Roster-sourced fields: regulation_type from DCF's Application Type, plus
+    # capacity and age range.
+    df = u.apply_regulation_subtype(df)
+    df = u.build_roster_profile(df)
+
     for col in df.columns:
         if df[col].dtype == object and df[col].apply(
                 lambda x: isinstance(x, str) and x.startswith('$')).any():
@@ -59,21 +64,19 @@ if __name__ == "__main__":
     df = u.parse_vacancies(df)
     df = u.parse_waitlist(df)
 
-    # regulation_type is already atomic text and is kept as-is via the stable
-    # scaffold in wi_columns.json.
-
-    # valid_target_values is omitted, so finalize() keeps every row, including
-    # rows whose qr_rating is invalid (0, 6, 2.5, 'Not Rated', ...) or missing.
+    # No valid_target_values: every row is kept, including invalid/missing ratings.
     df = u.finalize(df, COLUMNS_FILE, 'raw', KEY, TARGET, DYNAMIC_PREFIXES,
                     na_as_level=True)
 
-    # Collapse embedded newlines/carriage returns in preserved free-text cells so
-    # each provider stays on a single physical CSV line. Without this, raw's
-    # human-readable text fields inject line breaks that make raw's row count
-    # (e.g. via wc -l) diverge from full's, even though the record count matches.
+    # Keep each provider on one physical CSV line.
     for col in df.select_dtypes(include='object').columns:
         df[col] = df[col].map(
             lambda x: x.replace('\r\n', ' ').replace('\r', ' ').replace('\n', ' ')
             if isinstance(x, str) else x)
 
+    # Nullable Int64: unrated rows hold <NA>, and float64 would write '4.0'.
+    _numeric = pd.to_numeric(df[TARGET], errors='coerce')
+    assert (_numeric.isna() == df[TARGET].isna()).all(), \
+        'a non-numeric rating would be lost by the Int64 cast'
+    df[TARGET] = _numeric.astype('Int64')
     df.to_csv(OUTPUT, index=False)

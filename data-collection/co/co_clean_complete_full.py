@@ -1,29 +1,14 @@
 """
-co_clean_complete_full.py — Build the `complete_full` dataset: IDENTICAL
-feature engineering to `full` (strictly numeric/boolean + provider_id), but
-WITHOUT dropping rows whose qr_rating is invalid/unrated (the `complete`
-target policy).
+co_clean_complete_full.py — Build the `complete_full` dataset: same feature
+engineering as `full`, but rows whose qr_rating is invalid/unrated are kept.
+That includes provider types Colorado Shines never rates (School-Age Child
+Care Center, Resident Camp, Neighborhood Youth Organization). Row-aligned with
+complete_raw, not with raw/full.
 
-The four outputs, on two axes (preprocessing style x target filtering):
-
-                       drop invalid ratings        keep invalid (complete)
-  full  (numeric)      co_cleaned_full.csv         co_clean_complete_full.csv
-  raw   (text)         co_cleaned_raw.csv          co_clean_complete_raw.csv
-
-complete_full and complete_raw share the same early steps and the same (no)
-target filtering, so they are ROW-ALIGNED with each other -- a single fold
-file covers both. They are NOT row-aligned with raw/full, which restrict to
-valid 1-5 ratings. This includes providers whose type is structurally never
-rated by Colorado Shines (School-Age Child Care Center, Resident Camp,
-Neighborhood Youth Organization) alongside any
-genuinely unrated/pending ratable-type providers.
-
-Uses a no-op logger rather than co_clean_full.py's ParseLog: this runs the
-identical engineering over the identical input, so every parse warning it
-would produce is already captured in co_clean_full.log by the sibling script.
+Uses a no-op logger: every parse warning is already in co_clean_full.log.
 
 Run:
-    python co_clean_complete_full.py --input co_data/co_records.csv --output co_data/co_clean_complete_full.csv
+    python co_clean_complete_full.py
 """
 from __future__ import annotations
 
@@ -56,14 +41,13 @@ def main() -> None:
     print(f"[complete_full] loading {args.input}")
     df = pd.read_csv(args.input, low_memory=False, dtype=str)  # preserve leading zeros
 
-    # --- shared early steps (identical to raw/full, keeps engineering aligned)
     df = U.null_out_enrichment_on_mismatch(df, log)
     df = df.drop(columns=["errors"], errors="ignore")
     df = U.strip_dollars(df)
     U.check_grain_unique(df, U.ID_COL, log)
     df = df.drop(columns=[c for c in U.NON_FEATURE_COLS if c in df.columns], errors="ignore")
 
-    # --- base: id, target, numeric passthroughs (identical to co_clean_full.py)
+    # base: id, target, numeric passthroughs
     base = pd.DataFrame(index=df.index)
     base[U.ID_COL] = df[U.ID_COL]
     base[U.TARGET_COL] = df[U.TARGET_COL]
@@ -90,7 +74,6 @@ def main() -> None:
         if c in df.columns:
             base[c] = U.to_boolean(df[c], ("true",), ("false",))
 
-    # --- per-field builders (numeric / boolean only -- identical to full) ----
     parts = [base, U.derive_date_features(df, log)]
     if "hours_of_operation" in df.columns:
         parts.append(U.derive_operating_hours(df["hours_of_operation"], log))
@@ -103,18 +86,16 @@ def main() -> None:
     if "special_needs" in df.columns:
         parts.append(U.build_multivalue(df["special_needs"], ";", "need", "full"))
     if "languages_spoken" in df.columns:
-        parts.append(U.build_keyterm(df["languages_spoken"], U.LANGUAGE_KEYTERMS,
-                                     "language", "full", log))
-    parts.append(U.build_licensing_history(df, "full"))
+        # one column per recognised language; the k>=5 sweep folds rare ones
+        # into language_other
+        parts.append(U.build_language_features(df["languages_spoken"], "full", log))
+    parts.append(U.build_licensing_history(df, "full", log))
 
     engineered = pd.concat(parts, axis=1)
 
-    # which="full" -> reuse full's scaffold / discovered prefixes / numeric
-    # cast; keep_invalid_target=True -> retain unrated/out-of-range rows.
     out = U.finalize(engineered, "full", scaffold, log, keep_invalid_target=True)
 
-    # sanity: every non-id column must be numeric/boolean (qr_rating is
-    # nullable Int64 so unrated rows carry <NA> without breaking the guarantee)
+    # sanity: every non-id column must be numeric/boolean
     bad = [c for c in out.columns
            if c != U.ID_COL and not pd.api.types.is_numeric_dtype(out[c])
            and not pd.api.types.is_bool_dtype(out[c]) and out[c].dtype != "boolean"]

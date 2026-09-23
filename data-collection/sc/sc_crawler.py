@@ -1,61 +1,38 @@
 """
 sc_crawler.py — build the South Carolina ABC Quality per-provider dataset.
 
-SITE / APPROACH (Phase 0-1 recon, 2026-07-08)
----------------------------------------------
-South Carolina's QRIS is **ABC Quality** (SCDSS, Division of Early Care and
-Education). Two public directories exist:
+abcquality.org/provider-search is fully server-rendered and exposes a plain CSV
+export:
 
-  * scchildcare.org/provider-search — the state licensing directory. Its results
-    are loaded by client-side JS (AJAX); a plain GET returns only the empty form
-    listing. It was the original Checkpoint 0 pick but is the harder path (and
-    was intermittently down during recon).
-  * abcquality.org/provider-search   — the ABC Quality directory. **Fully
-    server-rendered**, and — the key find — it exposes a plain CSV export:
+    GET https://abcquality.org/provider-search/excel/?county=<County>
 
-        GET https://abcquality.org/provider-search/excel/?county=<County>
+Despite the UI calling it "Export to Excel", the response is `text/csv`. It is
+not paginated (the HTML view pages at 8 rows/page; the CSV returns the county's
+full result set), so the 46 SC counties are the entire state in 46 requests. No
+browser, no API keys, no anti-bot friction observed.
 
-    despite the UI calling it "Export to Excel", the response is
-    `Content-Type: text/csv`. It is **not paginated** (the HTML view pages at 8
-    rows/page; the CSV returns the county's full result set in one shot), so the
-    46 SC counties = the entire state in 46 requests. No browser, no API keys,
-    no anti-bot friction observed. This is the "downloadable dataset" tier the
-    project plan says to prefer, so that's what this crawler uses.
-
-CSV COLUMNS (verified against real responses)
+CSV COLUMNS
     Provider Name, Permit Type, Permit Number, Operator, Facility Type, Street,
     City, State, Zip, County, Phone, ABC Level, Last ABC Inspection Date,
     Capacity, Head Start, First Steps, Breastfeeding Friendly, Sleep Safe
 
-  `Permit Number` -> provider_id   (the state licensing/registration number)
-  `ABC Level`     -> qr_rating     (A+ / A / B+ / B / C; "P" = score pending;
-                                    EMPTY = licensed but unrated)
+  `Permit Number` is the state licensing/registration number; `ABC Level` is
+  the rating (A+ / A / B+ / B / C; "P" = score pending; empty = unrated).
 
-QUIRKS THAT DROVE THE DESIGN
+QUIRKS
   * `Permit Number` is NOT the id used in detail-page URLs. The site keys detail
     pages on an internal id (/provider/4800/union-day-school/) that is absent
-    from the CSV entirely. Per Checkpoint 1 we key on Permit Number only and do
-    not crawl detail pages, so that internal id never enters this pipeline.
-  * Exempt providers (`Permit Type` = "Not Licensed (Exempt)", `Facility Type`
-    = "EAA") have a **blank Permit Number** — they carry no state permit at all.
-    They ARE rated. They're kept here (the crawler is faithful to the source);
-    a later step decides their fate. See `exempt` flag below.
-  * The HTML results table's "Facility Type" column prints "Child Care Center"
-    for *every* row, including family child care homes. It is wrong/cosmetic.
-    The CSV's `Facility Type` code (A / C / EAA / ...) is the authoritative one.
-  * `Permit Number` must stay a STRING. It is numeric-looking; letting pandas
-    coerce it to int would destroy any leading zeros and turn blanks into NaN
-    -> 0. Everything is read with `dtype=str`.
-  * Ratings are ordered A+ > A > B+ > B > C, so the HTML view lists rated
-    providers first and unrated ones last. The CSV carries the same ordering;
-    it is not relied on.
+    from the CSV. Detail pages are not crawled, so that id never enters here.
+  * Exempt providers (`Permit Type` = "Not Licensed (Exempt)") have a blank
+    Permit Number but ARE rated. They are kept; see the `exempt` flag.
+  * The HTML results table prints "Child Care Center" as the Facility Type of
+    every row. The CSV's `Facility Type` code (A / C / EAA / ...) is the real one.
+  * `Permit Number` must stay a string, so everything is read with `dtype=str`.
 
 SELF-CHECK
-  For each county the crawler also fetches the HTML view and reads the page's
-  own "Displaying N Providers" headline, then compares N against the number of
-  CSV rows. A mismatch is logged loudly — it would mean the CSV export and the
-  HTML search disagree (e.g. a silently truncated export), which must be
-  investigated before the data is trusted.
+  For each county the crawler also reads the HTML view's "Displaying N
+  Providers" headline and compares N with the CSV row count. A mismatch is
+  logged loudly (e.g. a silently truncated export).
 
 Usage:
     python sc_crawler.py --counties Calhoun,McCormick     # smoke test (2 counties)
@@ -83,10 +60,6 @@ import pandas as pd
 import requests
 from bs4 import BeautifulSoup
 
-# ---------------------------------------------------------------------------
-# configuration
-# ---------------------------------------------------------------------------
-
 BASE_URL = 'https://abcquality.org'
 EXCEL_PATH = '/provider-search/excel/'   # returns text/csv despite the name
 HTML_PATH = '/provider-search/'          # used only for the row-count self-check
@@ -101,14 +74,12 @@ UA = ('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
 
 REQUEST_TIMEOUT = 45
 
-# All 46 South Carolina counties, taken verbatim from the county <select> on
-# abcquality.org/provider-search/advanced/ (so the spelling the site expects,
-# e.g. "McCormick", is preserved exactly).
+# The 46 counties, spelled exactly as the site's county <select> lists them
+# (e.g. "McCormick").
 SEED_PATH = "sc_data/sc_seed.csv"
 
 
 def _load_counties(path=SEED_PATH):
-    """The counties to sweep, one per row of the provided seed."""
     import csv as _csv
     with open(path, newline="", encoding="utf-8") as fh:
         return [r["county"].strip() for r in _csv.DictReader(fh)
@@ -119,8 +90,7 @@ SC_COUNTIES = _load_counties()
 assert len(SC_COUNTIES) == 46, f'expected 46 SC counties, got {len(SC_COUNTIES)}'
 assert len(set(SC_COUNTIES)) == 46, 'duplicate county in SC_COUNTIES'
 
-# The exact header the export serves. Checked on every county response so a
-# silent upstream schema change becomes a loud failure instead of bad data.
+# Checked on every response so an upstream schema change fails loudly.
 EXPECTED_COLUMNS = [
     'Provider Name', 'Permit Type', 'Permit Number', 'Operator',
     'Facility Type', 'Street', 'City', 'State', 'Zip', 'County', 'Phone',
@@ -132,10 +102,6 @@ EXEMPT_PERMIT_TYPE = 'Not Licensed (Exempt)'
 
 _COUNT_RE = re.compile(r'Displaying\s+([\d,]+)\s+Providers?', re.I)
 
-
-# ---------------------------------------------------------------------------
-# logging
-# ---------------------------------------------------------------------------
 
 def create_log_file(path=LOG_FILE):
     with open(path, 'w') as f:
@@ -152,46 +118,30 @@ def _slug(name):
     return re.sub(r'[^a-z0-9]+', '_', name.lower()).strip('_')
 
 
-# ---------------------------------------------------------------------------
-# id / value normalization
-# ---------------------------------------------------------------------------
-
 def _norm_id(value):
-    """Permit Number as a clean STRING, leading zeros intact.
-
-    Guards the one failure mode that silently corrupts the whole dataset: a
-    numeric-looking id round-tripping through a float ('16941.0') or losing a
-    leading zero. Blank/'-'/'nan' collapse to '' (exempt providers legitimately
-    have no permit number)."""
+    """Permit Number as a clean string, leading zeros intact. Blank/'-'/'nan'
+    collapse to '' (exempt providers have no permit number)."""
     if value is None:
         return ''
     s = str(value).strip()
     if s.lower() in ('', 'nan', 'none', '-', 'n/a'):
         return ''
-    s = re.sub(r'\.0$', '', s)          # '16941.0' -> '16941'
+    s = re.sub(r'\.0$', '', s)
     return s
 
 
 def _norm_rating(value):
-    """`ABC Level` verbatim, upper-cased and whitespace-stripped.
-
-    Kept as the native letter grade here — mapping to the numeric 1-5 scale
-    (C=1, B=2, B+=3, A=4, A+=5) is not this script's job -- the letter grade
-    is recorded exactly as the site prints it.
-    '' means the provider is licensed but carries no ABC Quality rating."""
+    """`ABC Level` as the native letter grade, upper-cased and stripped.
+    '' means the provider is licensed but unrated."""
     if value is None:
         return ''
     s = str(value).strip().upper()
     return '' if s.lower() in ('nan', 'none', 'n/a') else s
 
 
-# ---------------------------------------------------------------------------
-# one county
-# ---------------------------------------------------------------------------
-
 def fetch_county_csv(county, session=None):
-    """The county's full provider export. Returns raw CSV text, or None on
-    failure (logged, never raised — one bad county must not kill the sweep)."""
+    """The county's full export as CSV text, or None on failure (logged, never
+    raised, so one bad county cannot kill the sweep)."""
     session = session or requests
     try:
         r = session.get(BASE_URL + EXCEL_PATH, params={'county': county},
@@ -209,8 +159,7 @@ def fetch_county_csv(county, session=None):
 
 
 def fetch_county_stated_count(county, session=None):
-    """The HTML view's own 'Displaying N Providers' headline, for cross-checking
-    the CSV row count. None if it can't be read (never fatal)."""
+    """The HTML view's 'Displaying N Providers' count, or None."""
     session = session or requests
     try:
         r = session.get(BASE_URL + HTML_PATH, params={'county': county},
@@ -225,9 +174,7 @@ def fetch_county_stated_count(county, session=None):
 
 
 def parse_county_csv(text, county):
-    """CSV text -> DataFrame of strings. Validates the header before trusting a
-    single row, so an upstream schema change fails loudly rather than quietly
-    producing a dataset with the wrong column meanings."""
+    """CSV text -> DataFrame of strings, after validating the header."""
     df = pd.read_csv(io.StringIO(text), dtype=str, keep_default_na=False)
     missing = [c for c in EXPECTED_COLUMNS if c not in df.columns]
     if missing:
@@ -243,10 +190,6 @@ def parse_county_csv(text, county):
 def raw_path(county):
     return os.path.join(RAW_DIR, f'{_slug(county)}.csv')
 
-
-# ---------------------------------------------------------------------------
-# sweep
-# ---------------------------------------------------------------------------
 
 def sweep(counties, force=False, delay_range=(1.0, 2.5), check_counts=True):
     os.makedirs(RAW_DIR, exist_ok=True)
@@ -290,16 +233,11 @@ def sweep(counties, force=False, delay_range=(1.0, 2.5), check_counts=True):
             time.sleep(random.uniform(*delay_range))
 
 
-# ---------------------------------------------------------------------------
-# merge
-# ---------------------------------------------------------------------------
-
 def merge(counties, out_csv=MERGED_PATH):
     """Concatenate every cached county export into one row-per-provider table.
 
-    Dedup is on Permit Number, but ONLY among rows that actually have one:
-    exempt providers all share a blank permit number, so deduping naively would
-    collapse every exempt provider in the state into a single row."""
+    Dedup is on Permit Number only among rows that have one: exempt providers
+    all share a blank permit number and would otherwise collapse into one row."""
     frames, missing = [], []
     for county in counties:
         path = raw_path(county)

@@ -1,25 +1,13 @@
 """
-clean_complete_raw.py — Build the `complete_raw` dataset: IDENTICAL text-preserving
-feature engineering to `raw`, but WITHOUT dropping rows whose star rating is
-invalid/unrated (the `complete` target policy).
+nc_clean_complete_raw.py — Build the `complete_raw` dataset: the same
+text-preserving feature engineering as nc_clean_raw.py, but keeping rows whose
+star rating is invalid/unrated. qr_rating is nullable Int64; placeholders such
+as 'GS 110-106' become <NA> while the row survives.
 
-The five outputs, on two axes (preprocessing style × target filtering):
+complete_raw and complete_full are row-aligned with each other, not with
+raw/full.
 
-                       drop invalid ratings        keep invalid (complete)
-  full  (numeric)      nc_cleaned_full.csv         nc_clean_complete_full.csv
-  raw   (text)         nc_cleaned_raw.csv          nc_clean_complete_raw.csv
-
-complete_full and complete_raw share the same early steps and the same (no)
-target filtering, so they are ROW-ALIGNED with each other — a single fold file
-covers both. They are NOT row-aligned with full/raw, which restrict to valid
-1–5 ratings.
-
-The original text is preserved (raw mode); qr_rating is still coerced to a
-nullable Int64, with non-numeric placeholders such as 'GS 110-106' or blanks
-becoming <NA> while the row and all its text columns survive.
-
-Run:
-    python clean_complete_raw.py --input nc_records_sample.csv --output data/complete_raw.csv
+    python nc_clean_complete_raw.py
 """
 from __future__ import annotations
 
@@ -52,7 +40,7 @@ def main() -> None:
     print(f"[complete_raw] loading {args.input}")
     df = pd.read_csv(args.input, low_memory=False, dtype=str)  # preserve leading zeros
 
-    # --- shared early steps (identical to full/raw, keeps engineering aligned)
+    # --- shared early steps (identical in all four scripts) ------------------
     df = U.drop_error_rows(df, log)
     df = U.strip_dollars(df)
     U.check_grain_unique(df, U.ID_COL, log)
@@ -72,7 +60,7 @@ def main() -> None:
         if c in df.columns:
             base[c] = df[c]
 
-    # --- per-field builders (text-preserving — identical to raw) -------------
+    # --- per-field builders (text-preserving) --------------------------------
     parts = [base]
     if "ages_served" in df.columns:
         parts.append(U.parse_age_range(df["ages_served"], log))
@@ -94,8 +82,6 @@ def main() -> None:
 
     engineered = pd.concat(parts, axis=1)
 
-    # which="raw" → reuse raw's scaffold / discovered prefixes / exclusions /
-    # text preservation; keep_invalid_target=True → retain unrated/invalid rows.
     out = U.finalize(engineered, "raw", scaffold, log, keep_invalid_target=True)
 
     U.write_output(out, args.output)

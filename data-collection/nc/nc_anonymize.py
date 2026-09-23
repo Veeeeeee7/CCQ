@@ -10,7 +10,7 @@ HERE = Path(__file__).resolve().parent
 DEFAULT_INPUT = HERE / "nc_data" / "nc_records.csv"
 DEFAULT_OUTPUT = HERE / "nc_data" / "nc_records_anonymized.csv"
 LOG_FILE = HERE / "nc_privacy_log.txt"
-MAP_PATH = HERE.parent / "private" / "provider_id_map_nc.csv"
+MAP_PATH = HERE.parent / "data-private" / "provider_id_map_nc.csv"
 
 GRAIN_COL = "facility_id"
 STATE_CODE = "nc"
@@ -24,6 +24,13 @@ PRIVATE_COLS = [
     "phone",
     "email",
     "facility_url",
+    # Whole-page text dumps: each restates the facility name, street address,
+    # phone, owner's name and licence number. `operating_hours` can hold the
+    # same page text.
+    "star_section_text",
+    "visits_section_text",
+    "details_section_text",
+    "operating_hours",
 ]
 
 LEAKAGE_COLS: list[str] = [
@@ -42,7 +49,19 @@ def log(message: str, path: Path = LOG_FILE) -> None:
     print(message)
 
 
-def surrogate_ids(df: pd.DataFrame, state: str, seed=None) -> pd.DataFrame:
+def surrogate_ids(df: pd.DataFrame, state: str, seed=None,
+                  remint: bool = False) -> pd.DataFrame:
+    """Replace the grain with a random surrogate and write the id map.
+
+    np.random.default_rng(None) draws a FRESH permutation on every call, so
+    overwriting an existing map re-mints every provider_id and must be asked
+    for with --remint.
+    """
+    if MAP_PATH.exists() and not remint:
+        raise SystemExit(
+            f"{MAP_PATH} already exists. Re-running would draw a new "
+            f"permutation and change every provider_id in the release. "
+            f"Pass --remint if that is genuinely what you want.")
     values = df[GRAIN_COL].astype(str)
     distinct = list(dict.fromkeys(values))
     rng = np.random.default_rng(seed)
@@ -78,13 +97,14 @@ def main() -> None:
     ap.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     ap.add_argument("--dry-run", action="store_true",
                     help="report the drop list and exit without writing")
+    ap.add_argument("--remint", action="store_true",
+                    help="allow an existing provider id map to be overwritten "
+                         "with a fresh permutation (changes every id)")
     args = ap.parse_args()
 
     df = pd.read_csv(args.input, low_memory=False, dtype=str,
                      keep_default_na=False)
     before = df.shape
-
-    df = surrogate_ids(df, STATE_CODE)
 
     targets = drop_targets(df.columns)
     for col, cls in targets:
@@ -94,9 +114,12 @@ def main() -> None:
         log(f"[note] {len(missing)} listed column(s) absent from this input: "
             f"{missing}")
 
+    # --dry-run must return above surrogate_ids(), which rewrites the id map.
     if args.dry_run:
         print(f"\ndry run: would drop {len(targets)} of {before[1]} columns")
         return
+
+    df = surrogate_ids(df, STATE_CODE, remint=args.remint)
 
     out = df.drop(columns=[c for c, _ in targets], errors="ignore")
 

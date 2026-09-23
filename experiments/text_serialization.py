@@ -1,16 +1,9 @@
-"""Serialization of a provider record into natural-language text.
+"""Serialize a provider record into sectioned natural-language text.
 
-Produces one string per row, used by every text-based method and by the
-embedding-based tabular transfer arm. Follows the textual view of PEDCA-FT
-(Lu et al., 2025).
+False or missing values are omitted, true flags render as phrases, and all-missing
+age tiers are dropped.
 
-Fields are grouped into bracketed sections. False and missing booleans are
-omitted, as are missing numerics; true flags render as phrases rather than
-`name: True`. An age-tier block is dropped entirely when every field in it is
-missing. Compliance history renders in one of three modes (verbose, summary,
-abnormal_only).
-
-The bucketing constants below are schema-specific; the serializer is not.
+    python text_serialization.py --input data/mt_records_cleaned_raw.csv --n 3
 """
 from __future__ import annotations
 
@@ -18,25 +11,19 @@ from typing import Literal
 
 import pandas as pd
 
-# -----------------------------------------------------------------------------
-# Bucket rules — edit here if the schema changes
-# -----------------------------------------------------------------------------
+# ---- Schema-specific bucket rules ----
 
-# Columns NEVER serialized (target + any leakage / index cols).
-# provider_id is already dropped by utils.load_data(); listed here for safety.
+# Never serialized: the target and the row id.
 DROP_COLS: set[str] = {"provider_id", "qr_rating"}
 
 CURRICULUM_COL = "curriculum"
 
-# Boolean columns by prefix. A column matching one of these is treated as
-# a Yes/No flag: True/Yes/1 → render under its group section; False/No/NaN → skip.
 BOOLEAN_PREFIXES: tuple[str, ...] = (
     "has_",
     "environment_has_",
     "ages_served_",
 )
 
-# Boolean columns by exact name (don't match the prefix patterns).
 BOOLEAN_EXACT: set[str] = {
     "non_profit",
     "accepts_children_new",
@@ -45,8 +32,7 @@ BOOLEAN_EXACT: set[str] = {
     "temporary_closure",
 }
 
-# Age-tier blocks: each tier's fields share the same suffix.
-# Order matters — sections render in this order.
+# Age tiers in render order; a tier's fields are AGE_FIELD_LABELS prefix + tier suffix.
 AGE_TIERS: list[tuple[str, str]] = [
     ("under_1_year",          "Under 1 year"),
     ("1_year",                "1 year"),
@@ -57,8 +43,6 @@ AGE_TIERS: list[tuple[str, str]] = [
     ("5_years_and_older",     "5 yr and older"),
 ]
 
-# Field prefixes that belong to an age tier; each maps to a readable label.
-# A column counts as part of a tier iff its name == prefix + tier_suffix.
 AGE_FIELD_LABELS: dict[str, str] = {
     "weekly_full_day_":      "weekly full-day rate",
     "weekly_before_school_": "weekly before-school rate",
@@ -70,9 +54,7 @@ AGE_FIELD_LABELS: dict[str, str] = {
     "day_camp_(min-max)_":   "day camp (min-max)",
 }
 
-# Boolean flag groups: which section a flag appears under, and its order.
-# Each entry is (section_label, predicate). Predicates run in order, first
-# match wins. Anything boolean that doesn't match falls into "[Other]".
+# (section, predicate) in render order; first match wins, unmatched flags go to [Other].
 BOOLEAN_GROUPS: list[tuple[str, "callable"]] = [
     ("Accepts",        lambda c: c.startswith("accepts_children_")),
     ("Ages served",    lambda c: c.startswith("ages_served_")),
@@ -90,20 +72,16 @@ ComplianceMode = Literal["verbose", "summary", "abnormal_only"]
 COMPLIANCE_YEARS = ("2026", "2025", "2024")
 
 
-# -----------------------------------------------------------------------------
-# Helpers
-# -----------------------------------------------------------------------------
 _TRUE_TOKENS = {"true", "yes", "1", "1.0", "t", "y"}
 
 def _is_true(v) -> bool:
-    """Robust truthiness for mixed-dtype CSV booleans (True / 'Yes' / 1 / '1.0')."""
+    """Truthiness for mixed-dtype CSV booleans (True / 'Yes' / 1 / '1.0')."""
     if v is None or (isinstance(v, float) and pd.isna(v)):
         return False
     return str(v).strip().lower() in _TRUE_TOKENS
 
 
 def _has_value(v) -> bool:
-    """True iff v is non-null and not the empty string."""
     if v is None:
         return False
     if isinstance(v, float) and pd.isna(v):
@@ -117,7 +95,6 @@ def _is_boolean_col(col: str) -> bool:
 
 
 def _age_tier_of(col: str) -> tuple[str, str] | None:
-    """Return (tier_suffix, tier_name) if col is an age-tier field, else None."""
     for tier_suf, tier_name in AGE_TIERS:
         for pre in AGE_FIELD_LABELS:
             if col == pre + tier_suf:
@@ -126,11 +103,7 @@ def _age_tier_of(col: str) -> tuple[str, str] | None:
 
 
 def _strip_flag_prefix(col: str) -> str:
-    """Drop the category prefix from a boolean flag column for readable display.
-
-    Order matters: longer / more specific prefixes are checked first so we
-    strip 'environment_has_' before falling back to 'has_'.
-    """
+    # Specific prefixes must precede the bare "has_".
     for pre in ("environment_has_", "has_services_", "has_transport_",
                 "has_meal_", "has_summer_camp_", "has_", "ages_served_",
                 "accepts_children_"):
@@ -140,16 +113,12 @@ def _strip_flag_prefix(col: str) -> str:
 
 
 def _readable(col: str) -> str:
-    """Human-readable column label (underscores → spaces)."""
     return col.replace("_", " ")
 
 
-# -----------------------------------------------------------------------------
-# Section renderers
-# -----------------------------------------------------------------------------
+# ---- Section renderers ----
 def _render_provider_info(row: pd.Series, exclude: set[str]) -> str | None:
-    """Everything that isn't a flag, age-tier field, compliance field,
-    curriculum, or dropped. Numerics + categoricals + free-text all here."""
+    """Every field that is not a flag, age-tier, compliance, curriculum or dropped column."""
     bits = []
     for col in row.index:
         if col in exclude or col in DROP_COLS:
@@ -181,12 +150,9 @@ def _render_curriculum(row: pd.Series) -> str | None:
 
 
 def _render_boolean_flags(row: pd.Series) -> list[str]:
-    """Group True flags into sections, skip Falses, return one string per
-    non-empty group."""
-    # First-pass: collect all True boolean columns
+    """One string per non-empty flag group, listing only True flags."""
     true_cols = [c for c in row.index if _is_boolean_col(c) and _is_true(row[c])]
 
-    # Assign each true col to its group (first matching predicate, else "Other")
     grouped: dict[str, list[str]] = {label: [] for label, _ in BOOLEAN_GROUPS}
     grouped["Other"] = []
     for col in true_cols:
@@ -199,7 +165,6 @@ def _render_boolean_flags(row: pd.Series) -> list[str]:
         if not placed:
             grouped["Other"].append(_strip_flag_prefix(col))
 
-    # Render non-empty groups in declared order, "Other" last
     out = []
     for label, _ in BOOLEAN_GROUPS:
         items = grouped[label]
@@ -211,8 +176,7 @@ def _render_boolean_flags(row: pd.Series) -> list[str]:
 
 
 def _render_age_tiers(row: pd.Series) -> list[str]:
-    """One section per age tier with at least one populated field. Tiers
-    where every field is NaN drop entirely (implicit 'not served')."""
+    """One section per age tier with at least one populated field."""
     sections = []
     for tier_suf, tier_name in AGE_TIERS:
         bits = []
@@ -230,7 +194,6 @@ def _render_age_tiers(row: pd.Series) -> list[str]:
 
 
 def _render_compliance(row: pd.Series, mode: ComplianceMode) -> str | None:
-    """Compliance section in one of three modes."""
     comp_cols = [c for c in row.index if "compliance" in c]
     if not comp_cols:
         return None
@@ -266,7 +229,7 @@ def _render_compliance(row: pd.Series, mode: ComplianceMode) -> str | None:
                         bits.append(f"{y} violations: {row[tv_col]}")
                 except (ValueError, TypeError):
                     pass
-            # find per-category gaps (rules_met < rules_total)
+            # Per-category gaps: rules_met < rules_total.
             met_cols = [c for c in row.index
                         if c.startswith(f"{y}_compliance_")
                         and c.endswith("_rules_met")
@@ -290,20 +253,12 @@ def _render_compliance(row: pd.Series, mode: ComplianceMode) -> str | None:
     raise ValueError(f"Unknown compliance_mode: {mode}")
 
 
-# -----------------------------------------------------------------------------
-# Public API
-# -----------------------------------------------------------------------------
+# ---- Public API ----
 def serialize_row(
     row: pd.Series,
     compliance_mode: ComplianceMode = "verbose",
 ) -> str:
-    """Serialize one provider row to a structured natural-language string.
-
-    Section order (any empty section is dropped):
-      [Provider Info] → [Curriculum] → boolean groups (Accepts, Ages served,
-      Meals offered, Transport, Summer camp, Services, Environment, Other) →
-      age-tier blocks → [Compliance]
-    """
+    """Serialize one row into its sections, dropping empty ones."""
     sections: list[str] = []
     pi = _render_provider_info(row, exclude=set())
     if pi: sections.append(pi)
@@ -320,13 +275,10 @@ def serialize_dataframe(
     df: pd.DataFrame,
     compliance_mode: ComplianceMode = "verbose",
 ) -> pd.Series:
-    """Vectorized: serialize every row of df. Returns a pd.Series of strings."""
+    """Serialize every row of df; returns a Series of strings."""
     return df.apply(lambda r: serialize_row(r, compliance_mode), axis=1)
 
 
-# -----------------------------------------------------------------------------
-# CLI: preview serializations from the raw CSV for sanity-checking
-# -----------------------------------------------------------------------------
 if __name__ == "__main__":
     import argparse
     from pathlib import Path
@@ -334,9 +286,9 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Preview row serializations.")
     parser.add_argument("--input", type=Path, default=DEFAULT_DATA_PATH,
-                        help=f"Raw dataset CSV to preview (default: {DEFAULT_DATA_PATH}).")
+                        help=f"Raw dataset CSV (default: {DEFAULT_DATA_PATH}).")
     parser.add_argument("--n", type=int, default=3,
-                        help="Number of rows to print (default 3)")
+                        help="Number of rows to print.")
     parser.add_argument("--compliance", choices=("verbose", "summary", "abnormal_only"),
                         default="verbose")
     args = parser.parse_args()

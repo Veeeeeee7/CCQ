@@ -10,7 +10,7 @@ HERE = Path(__file__).resolve().parent
 DEFAULT_INPUT = HERE / "ca_data" / "ca_records.csv"
 DEFAULT_OUTPUT = HERE / "ca_data" / "ca_records_anonymized.csv"
 LOG_FILE = HERE / "ca_privacy_log.txt"
-MAP_PATH = HERE.parent / "private" / "provider_id_map_ca.csv"
+MAP_PATH = HERE.parent / "data-private" / "provider_id_map_ca.csv"
 
 GRAIN_COL = "facility_number"
 STATE_CODE = "ca"
@@ -82,25 +82,51 @@ def main() -> None:
     ap.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     ap.add_argument("--dry-run", action="store_true",
                     help="report the drop list and exit without writing")
+    ap.add_argument("--remint", action="store_true",
+                    help=f"allow overwriting an existing {MAP_PATH.name}. "
+                         "Every provider_id is re-drawn, so every "
+                         "already-released id for this state is invalidated. "
+                         "Required whenever the map already exists.")
     args = ap.parse_args()
 
     df = pd.read_csv(args.input, low_memory=False, dtype=str,
                      keep_default_na=False)
     before = df.shape
 
+    targets = drop_targets(df.columns)
+    missing = [c for c in PRIVATE_COLS + LEAKAGE_COLS if c not in df.columns]
+
+    # --dry-run must return before surrogate_ids(), which rewrites MAP_PATH
+    # from a fresh permutation.
+    if args.dry_run:
+        for col, cls in targets:
+            print(f"[{cls}] would drop {col}")
+        if missing:
+            print(f"[note] {len(missing)} listed column(s) absent from this "
+                  f"input: {missing}")
+        print(f"\ndry run: would drop {len(targets)} of {before[1]} columns; "
+              f"{MAP_PATH.name} and {args.output.name} untouched")
+        return
+
+    if MAP_PATH.exists() and not args.remint:
+        raise SystemExit(
+            f"refusing to run: {MAP_PATH} already exists.\n"
+            "  A real run draws a NEW random provider_id permutation, which "
+            "breaks the join\n"
+            "  between every already-released file and the private map. "
+            "Repair stage-1 columns\n"
+            "  in place with ca_data_correction.py instead. If you really "
+            "mean to re-mint every\n"
+            "  id, pass --remint."
+        )
+
     df = surrogate_ids(df, STATE_CODE)
 
-    targets = drop_targets(df.columns)
     for col, cls in targets:
         log(f"[{cls}] dropping {col}")
-    missing = [c for c in PRIVATE_COLS + LEAKAGE_COLS if c not in df.columns]
     if missing:
         log(f"[note] {len(missing)} listed column(s) absent from this input: "
             f"{missing}")
-
-    if args.dry_run:
-        print(f"\ndry run: would drop {len(targets)} of {before[1]} columns")
-        return
 
     out = df.drop(columns=[c for c, _ in targets], errors="ignore")
 

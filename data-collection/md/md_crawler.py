@@ -1,41 +1,32 @@
 """
 md_crawler.py — Maryland EXCELS "Find a Program" crawler.
 
-Unlike the other four states, this doesn't scrape rendered DOM at all.
-Phase 1 recon (network_log.json) caught findaprogram.marylandexcels.org's Vue
-front end calling a plain JSON/CSV API, and testing it directly confirmed:
+findaprogram.marylandexcels.org's Vue front end calls a plain JSON/CSV API
+(no auth, no cookies):
 
   GET /api/fap/referencedata                        — accreditation/achievement
                                                         and program-type lookups
   GET /api/fap/count?county=<county>                 — count of matching programs
   GET /api/fap/csv/programs?county=<county>&sort=2   — full CSV export for a county
 
-No auth/cookies required. The CSV export has no count/offset params (unlike
-the paginated JSON /search endpoint) and returned all 62 Allegany rows in one
-response, so this crawler is just: loop over Maryland's 23 counties + independent
-Baltimore City, hit the CSV endpoint once each, concatenate. No Playwright, no
-browser — this is the simplest of the five states' crawlers by a wide margin.
+The CSV export is unpaginated, so the crawler loops over Maryland's 23
+counties + Baltimore City, hits the CSV endpoint once each and concatenates.
+The export's columns are kept as-is; _source_county (the query) and
+_fetched_at are prepended.
 
-The CSV's own columns are kept as-is (Program Name, Program Type, Program ID,
-..., Quality Rating, LIC/STF/ACR/APV/TQF/AVR/DAP/ADM indicator sub-scores,
-Achievements, Accreditations, ...) — renaming/typing happens in md_clean_raw.py,
-not here. Two crawl-metadata columns are prepended: _source_county (the query
-that produced the row) and _fetched_at.
+County spellings are the portal's ("Saint Mary's", not MSDE's "St. Mary's";
+"Baltimore" and "Baltimore City" are separate). An unknown spelling answers 0,
+so the crawler calls /count first and stops on a zero/None count, cross-checks
+the parsed row count against it, and at the end asserts that every seeded
+county produced rows.
 
-A few counties' exact server-side spelling is unconfirmed (apostrophes in
-"Prince George's"/"Queen Anne's", "St. Mary's" vs "Saint Mary's", "Baltimore"
-vs "Baltimore City" both existing as separate jurisdictions). Rather than
-trust the hardcoded list blindly, this crawler calls /count for each county
-first and logs a loud warning (not a crash) for anything that comes back
-zero/None, and cross-checks the parsed CSV row count against that /count —
-so a misspelled county is easy to spot in md_crawler_log.txt and fix in
-COUNTIES below, rather than silently missing data.
+    python md_crawler.py --limit 3             # smoke test, 3 counties
+    python md_crawler.py                       # full run (~24 requests)
+    python md_crawler.py --resume              # continue an interrupted run
 
-    python md_crawler.py --limit 3                      # smoke test, 3 counties
-    python md_crawler.py                                # full run (~24 requests)
-
-Resume-safe: re-running skips counties already present in the output CSV's
-_source_county column.
+Resume is opt-in: --resume skips COUNTIES (not providers) already present in
+the output's _source_county column; without it the crawler refuses to append
+to a non-empty output.
 
 Deps: pip install requests pandas
 """
@@ -52,21 +43,15 @@ from datetime import datetime, timezone
 import pandas as pd
 import requests
 
-# ---------------------------------------------------------------------------
-# configuration
-# ---------------------------------------------------------------------------
-
 BASE_URL = 'https://findaprogram.marylandexcels.org/api/fap'
 COUNT_URL = f'{BASE_URL}/count'
 CSV_URL = f'{BASE_URL}/csv/programs'
 
 LOG_FILE = 'md_crawler_log.txt'
 
-# Maryland's 23 counties + independent Baltimore City. "Allegany" is confirmed
-# working against the live API (Phase 1). The rest are the spellings MSDE's
-# own monthly EXCELS reports use, but are UNCONFIRMED against this specific
-# API — that's what the /count pre-check in crawler() is for.
-SEED_PATH = "md_data/md_seed.csv"
+# Maryland's 23 counties + Baltimore City, in the portal's own spellings. The
+# seed sits beside the scripts because md_data/ is gitignored.
+SEED_PATH = "md_seed.csv"
 
 
 def _load_counties(path=SEED_PATH):
@@ -84,10 +69,6 @@ UA = ('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
       'Chrome/120.0.0.0 Safari/537.36')
 
 
-# ---------------------------------------------------------------------------
-# logging
-# ---------------------------------------------------------------------------
-
 def create_log_file(path=LOG_FILE):
     if os.path.exists(path):
         os.remove(path)
@@ -99,10 +80,6 @@ def log(message, file=LOG_FILE):
         f.write(message + '\n')
     print(message)
 
-
-# ---------------------------------------------------------------------------
-# transport
-# ---------------------------------------------------------------------------
 
 def _get(session, url, params, timeout, retries=2, backoff=2.0):
     last_exc = None
@@ -129,10 +106,6 @@ def fetch_csv(session, county, timeout=30):
     return resp.text
 
 
-# ---------------------------------------------------------------------------
-# resume + output helpers (rectangular CSV, append-per-county)
-# ---------------------------------------------------------------------------
-
 def load_completed_counties(output_csv):
     if not output_csv or not os.path.exists(output_csv):
         return set()
@@ -145,9 +118,8 @@ def load_completed_counties(output_csv):
 
 
 def append_rows(csv_text, county, output_csv):
-    """Parse the CSV export's raw text and append every row, tagged with
-    crawl metadata, to output_csv. The source's own column names/order are
-    left untouched — cleaning/renaming happens in md_clean_raw.py."""
+    """Append every row of one county's CSV export, tagged with crawl
+    metadata, to output_csv. The source's column names/order are untouched."""
     df = pd.read_csv(io.StringIO(csv_text), dtype=str)
     df = df.loc[:, ~df.columns.str.match(r'^Unnamed')]  # trailing blank-header column
     if 'County' in df.columns:
@@ -165,13 +137,28 @@ def append_rows(csv_text, county, output_csv):
     return len(df)
 
 
-# ---------------------------------------------------------------------------
-# main crawler
-# ---------------------------------------------------------------------------
+def assert_full_coverage(output_csv, counties):
+    """Every seeded county must have produced at least one row (catches a
+    county whose fetch raised and was logged-and-skipped)."""
+    found = load_completed_counties(output_csv)
+    missing = [c for c in counties if c not in found]
+    if missing:
+        log(f'INCOMPLETE: {len(missing)} of {len(counties)} seeded county/ies '
+            f'produced no rows: {missing}. {output_csv} is NOT a complete '
+            f'Maryland crawl — re-run those counties before using it.')
+        raise SystemExit(3)
+    log(f'Coverage OK: all {len(counties)} seeded counties are present in '
+        f'{output_csv}.')
+
 
 def crawler(counties, output_csv='md_data/md_records.csv',
-            start_index=0, limit=None, delay_range=(1.5, 3.0)):
+            start_index=0, limit=None, delay_range=(1.5, 3.0), resume=False):
     completed = load_completed_counties(output_csv)
+    if completed and not resume:
+        log(f'REFUSING to append: {output_csv} already holds '
+            f'{len(completed)} county/ies. Move the file aside for a fresh '
+            f'crawl, or pass --resume to continue an interrupted one.')
+        raise SystemExit(4)
     if completed:
         log(f'Resuming: {len(completed)} counties already in {output_csv} — skipping.')
     end = len(counties) if limit is None else min(len(counties), start_index + limit)
@@ -189,12 +176,19 @@ def crawler(counties, output_csv='md_data/md_records.csv',
             expected = None
             try:
                 expected = fetch_count(session, county)
-                if not expected:
-                    log(f'[{index}] WARNING: /count for {county!r} returned '
-                        f'{expected!r} — double-check this county\'s spelling '
-                        f'against findaprogram.marylandexcels.org directly.')
             except Exception:
                 log(f'[{index}] (count check failed for {county}, trying the CSV anyway)')
+            else:
+                if not expected:
+                    # A zero count is a spelling the portal does not know;
+                    # continuing would append nothing and mark the county done.
+                    log(f'[{index}] FATAL: /count for {county!r} returned '
+                        f'{expected!r}. The portal does not know that spelling '
+                        f'— check it against findaprogram.marylandexcels.org '
+                        f'and fix {SEED_PATH}. Nothing was appended for this '
+                        f'county; the crawl is stopping rather than shipping a '
+                        f'silent hole.')
+                    raise SystemExit(2)
 
             try:
                 csv_text = fetch_csv(session, county)
@@ -224,9 +218,15 @@ if __name__ == '__main__':
     ap.add_argument('--limit', type=int, default=None)
     ap.add_argument('--delay-min', type=float, default=1.5)
     ap.add_argument('--delay-max', type=float, default=3.0)
+    ap.add_argument('--resume', action='store_true',
+                    help='continue an interrupted crawl by skipping counties '
+                         'already present in the output')
     args = ap.parse_args()
 
     create_log_file()
     log(f'Counties: {len(COUNTIES)}.')
     crawler(COUNTIES, output_csv=args.output, start_index=args.start_index,
-            limit=args.limit, delay_range=(args.delay_min, args.delay_max))
+            limit=args.limit, delay_range=(args.delay_min, args.delay_max),
+            resume=args.resume)
+    if args.start_index == 0 and args.limit is None:
+        assert_full_coverage(args.output, COUNTIES)

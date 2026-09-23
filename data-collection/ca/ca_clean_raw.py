@@ -1,15 +1,11 @@
 """
-clean_raw.py — Build the `raw` dataset (text preserved and maximally
-decomposed, plus the scalar extractions) for LLM-based methods.
+ca_clean_raw.py — Build the `raw` view (text preserved and maximally
+decomposed, plus the scalar extractions), valid ratings (1..5) only.
 
-Row-aligned with full.csv: same source, same error-row filter, same dedup and
-target filtering, so one set of CV folds applies to both.
+Row-aligned with the `full` view: same source, same error-row filter, same
+dedup and target filtering.
 
-    python clean_raw.py \
-        --input facility_records_sample.csv \
-        --output raw.csv \
-        --scaffold columns_scaffold.json \
-        --log parse_log_raw.txt
+    python ca_clean_raw.py
 """
 from __future__ import annotations
 
@@ -46,9 +42,9 @@ def main() -> None:
     df = pd.read_csv(args.input, dtype=str, low_memory=False)
     print(f"[{WHICH}] loaded {len(df)} rows, {df.shape[1]} columns from {args.input.name}")
 
-    df = drop_error_rows(df, log=log)        # user requirement, before everything
+    df = drop_error_rows(df, log=log)
     check_grain_uniqueness(df, "facility_number")
-    df = dollar_strip_df(df, log=log)        # TYPE 2 (harmless if no currency)
+    df = dollar_strip_df(df, log=log)
     df = engineer_features(df, WHICH, log=log)
     out = finalize(df, WHICH, scaffold, log=log)
 

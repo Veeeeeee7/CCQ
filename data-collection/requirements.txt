@@ -22,19 +22,5 @@ beautifulsoup4==4.14.3
 # after pip. The other six states are plain HTTP and do not need this.
 playwright==1.59.0
 
-# ---------------------------------------------------------------------------
-# Optional
-# ---------------------------------------------------------------------------
-# sc_tls_probe.py — diagnoses South Carolina's TLS handshake, which is fussy
-# about ciphers on some machines. Only needed if sc_crawler.py fails to connect.
-#
-# httpx==0.28.1
-# curl_cffi==0.15.0
-#
-# ca_data_analysis.py — a one-off inspection helper, not part of the pipeline.
-#
-# matplotlib
-# scikit-learn
-
 # BeautifulSoup is only ever called with the stdlib 'html.parser', so lxml and
 # html5lib are deliberately absent.

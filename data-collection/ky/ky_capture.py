@@ -1,79 +1,31 @@
 """
 ky_capture.py — Kentucky rendered-DOM + network capture helper
-================================================================
 
-Kentucky publishes per-provider Kentucky All STARS ratings through kynect,
-the Commonwealth's unified benefits portal, not through a Division of Child
-Care site of its own:
+Kentucky publishes per-provider Kentucky All STARS ratings through kynect's
+Public Child Care Search:
 
     https://kynect.ky.gov/benefits/s/child-care-provider?origin=program-page&language=en_US
 
-("Public Child Care Search" -- linked from CHFS's own Find Child Care page.
-Per CHFS: "lists only providers certified or licensed. You can also view
-inspection reports, hours of operation and Kentucky All STARS level.")
+A plain HTTP fetch returns only a Salesforce Lightning/Aura bootstrap shell
+("Sorry to interrupt / CSS Error"), so the page needs a real browser.
 
-A plain HTTP fetch of that URL returns nothing but a loading shell and
-"Sorry to interrupt / CSS Error" -- the classic Salesforce Lightning/Aura
-bootstrap-failure message you get without JS. That's the same signature seen
-on Michigan's CCHIRP (cclb.my.site.com/micchirp), which turned out to be
-Salesforce Experience Cloud (Aura/LWC). No open-data download or documented
-API for KY All STARS turned up in research, so this SPA is currently believed
-to be the only public per-provider source -- treat this capture as confirming
-(or correcting) that guess.
-
-A web search also surfaced what looks like a separate detail-page route:
-    https://kynect.ky.gov/benefits/s/child-care-provider-details?language=en_US
-(page title "Kentucky Child Care Provider Details"). The query param that
-addresses a specific provider on that route is UNCONFIRMED -- that's one of
-the main things this capture should nail down: click into a result and see
-what the URL actually looks like once there.
-
-This script doesn't hardcode selectors: it opens a real, human-driven browser
-on --start-url, and every time you press Enter in this terminal it saves
-whatever page is currently frontmost -- rendered HTML, a screenshot, and
-(cumulative for the whole session) any XHR/fetch network traffic. The network
-capture is the important part: if search results come back as a clean JSON
-payload from an Aura/Apex endpoint, we can hit that directly instead of
-scraping rendered DOM -- far more robust, and the playbook's preferred
-delivery mechanism when available (other states have had that shortcut pay off
-via a "blank search returns everything" export).
-
-What to look for while driving it manually:
-  - Does /child-care-provider require login, or is it truly public? CHFS
-    links it directly to families with no mention of an account, so it
-    SHOULD be public. If you land on a kynect login/registration screen
-    instead, STOP and flag that immediately -- it would mean ratings are
-    gated, which changes the Phase 0 scrapeability call.
-  - Can you get ALL providers (a blank/broad search, or a "download
-    results"/export button), or only narrow per-name/per-address slices?
-  - The exact label of the ID field (License Number? Certificate Number?
-    Program ID? something else?), and whether Type I centers, Type II
-    centers, and Certified Family Child Care Homes all expose it the same
-    way.
-  - The exact label/format of the All STARS rating (e.g. "Level 3" text, a
-    star-icon count, a CSS class like Colorado's span.rating-2) -- and what
-    a "not participating" / opted-out provider looks like when it has no
-    level at all.
-  - Whether the inspection history CHFS mentions appears inline on the
-    provider-details page or needs another click/tab.
-  - Any CAPTCHA challenge (checkbox or invisible v3) anywhere in the flow --
-    note exactly where/when it appears.
+Opens a human-driven browser on --start-url; every time you press Enter in
+this terminal it saves the frontmost page (rendered HTML + screenshot) and
+the session's cumulative XHR/fetch traffic, which is where the Aura/Apex JSON
+payloads behind the search show up.
 
 Two modes:
 
-  Interactive (default): a browser window opens on --start-url. Search,
-  click into a couple of different provider types (a Type I center, and if
-  you can find one, a Certified Family Child Care Home), open the details
-  page, then come back here and press Enter to capture whatever is
-  frontmost. Repeat as many times as useful; type 'q' to quit.
+  Interactive (default): search, open a couple of provider detail pages,
+  press Enter to capture the frontmost page; 'q' to quit.
 
-  URL list: pass --urls U1 U2 ... to (re)visit + capture each headlessly --
-  only useful once URL patterns are already known, which they aren't yet.
+  URL list: --urls U1 U2 ... visits and captures each URL (optionally
+  headless).
 
 Usage:
   python ky_capture.py                        # interactive, headful, starts on the search page
   python ky_capture.py --out-dir ky_captures
-  python ky_capture.py --urls "https://kynect.ky.gov/benefits/s/child-care-provider-details?..."   # later, headless
+  python ky_capture.py --urls "https://kynect.ky.gov/benefits/s/child-care-provider-details?..."   # headless
 
 Deps: pip install playwright && playwright install chromium
 """
@@ -89,16 +41,12 @@ from datetime import datetime
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
 SEARCH_URL = 'https://kynect.ky.gov/benefits/s/child-care-provider?origin=program-page&language=en_US'
-BASE_URL = 'https://kynect.ky.gov/benefits/'
 
 UA = ('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
       'AppleWebKit/537.36 (KHTML, like Gecko) '
       'Chrome/120.0.0.0 Safari/537.36')
 
-# Cheap platform fingerprint, printed after every capture so it's obvious
-# from the terminal alone (no need to open the HTML by hand) whether this
-# really is Salesforce Lightning/Aura, and whether a captcha vendor shows up
-# anywhere in the loaded markup.
+# Platform fingerprint printed after every capture.
 FINGERPRINTS = {
     'Salesforce Lightning/Aura bootstrap': re.compile(r'auraConfig|/auraFW/|lightning/lightning\.out'),
     'Salesforce Experience Cloud site path': re.compile(r's/sfsites|sfdcStatic'),
@@ -110,18 +58,9 @@ FINGERPRINTS = {
 
 def wait_for_render(page, selector=None, settle_ms=1500, timeout_ms=30000,
                     poll_ms=400):
-    """Wait for client-side rendering to settle.
-
-    Do NOT wait on networkidle: if this really is Salesforce Lightning/Aura
-    (per the "CSS Error" shell seen in a plain fetch), Experience Cloud sites
-    keep background polling/telemetry connections open and networkidle would
-    hang -- same reasoning as WI's Blazor and MI's CCHIRP captures.
-
-    If `selector` is given, wait for that element (once a stable rendered
-    node is known, e.g. a results-row class). Otherwise fall back to a
-    content-settle heuristic: poll document.body.innerText length and return
-    once it's unchanged for `settle_ms`.
-    """
+    """Wait for `selector`, or until body innerText length is unchanged for
+    `settle_ms`. Not networkidle: Experience Cloud keeps background
+    connections open, so networkidle would hang."""
     if selector:
         page.wait_for_selector(selector, timeout=timeout_ms)
         return
@@ -144,14 +83,11 @@ def wait_for_render(page, selector=None, settle_ms=1500, timeout_ms=30000,
             stable_since = None
             last_len = cur
         time.sleep(poll_ms / 1000.0)
-    # timed out -- return anyway; caller still gets whatever rendered
 
 
 def _mk_network_logger(network_log, out_dir, body_index):
-    """Returns a page/context 'response' handler that records XHR/fetch
-    traffic for the whole session. This is how we'd discover a clean
-    Aura/Apex JSON endpoint behind the search, instead of having to scrape
-    rendered DOM -- by far the more robust option if it exists."""
+    """'response' handler recording XHR/fetch traffic (and bodies) for the
+    whole session."""
     def on_response(resp):
         try:
             req = resp.request
@@ -220,9 +156,7 @@ def run_interactive(start_url, out_dir, executable_path, wait_selector, settle_m
                                       viewport={'width': 1400, 'height': 1000})
         page = context.new_page()
 
-        # One growing network log for the whole session (rewritten to disk
-        # after every capture). Attaching at the context level means it also
-        # catches traffic from a second tab.
+        # Context-level, so traffic from a second tab is caught too.
         network_log = []
         body_index = [0]
         context.on('response', _mk_network_logger(network_log, out_dir, body_index))
@@ -233,21 +167,7 @@ def run_interactive(start_url, out_dir, executable_path, wait_selector, settle_m
         print('INTERACTIVE CAPTURE -- Kentucky')
         print(f'A browser window is open on:\n  {start_url}')
         print()
-        print('If this lands on a kynect LOGIN/registration screen instead of')
-        print('a search form, STOP -- that would mean ratings are gated, which')
-        print('changes the Phase 0 scrapeability call. Report that immediately.')
-        print()
-        print('Suggested pass 1: try a blank or very broad search (e.g. just a')
-        print('single letter, or leave everything blank and hit Search) to see')
-        print('whether you can enumerate everything or only get narrow slices.')
-        print('Note any county/type filters, pagination, and any export/')
-        print('download button.')
-        print()
-        print('Suggested pass 2: open one result -- ideally a Type I center AND')
-        print('(if findable) a Certified Family Child Care Home. Note the ID')
-        print('field label, the rating field label/format, whether inspection')
-        print('history shows on the same page, and the URL pattern (does it')
-        print('carry an id you could hit directly later?).')
+        print('Run a search, then open one or more provider results.')
         print()
         print("When a page is fully rendered, come back here and press Enter")
         print("to capture it. Type 'q' then Enter to quit.")

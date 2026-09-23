@@ -1,26 +1,13 @@
 """
-clean_complete_full.py — Build the `complete_full` dataset: IDENTICAL feature
-engineering to `full` (strictly numeric/boolean + provider_id), but WITHOUT
-dropping rows whose star rating is invalid/unrated (the `complete` target
-policy). Supersedes the earlier clean_complete.py.
+nc_clean_complete_full.py — Build the `complete_full` dataset: the same
+numeric/boolean feature engineering as nc_clean_full.py, but keeping rows whose
+star rating is invalid/unrated. qr_rating is nullable Int64; placeholders such
+as 'GS 110-106' become <NA> while the row survives.
 
-The five outputs, on two axes (preprocessing style × target filtering):
+complete_raw and complete_full are row-aligned with each other, not with
+raw/full.
 
-                       drop invalid ratings        keep invalid (complete)
-  full  (numeric)      nc_cleaned_full.csv         nc_clean_complete_full.csv
-  raw   (text)         nc_cleaned_raw.csv          nc_clean_complete_raw.csv
-
-complete_full and complete_raw share the same early steps and the same (no)
-target filtering, so they are ROW-ALIGNED with each other — a single fold file
-covers both. They are NOT row-aligned with full/raw, which restrict to valid
-1–5 ratings.
-
-qr_rating stays numeric (nullable Int64): a real out-of-range score is kept;
-non-numeric placeholders such as 'GS 110-106' or blanks become <NA>, but the
-row and all its features survive.
-
-Run:
-    python clean_complete_full.py --input nc_records_sample.csv --output data/complete_full.csv
+    python nc_clean_complete_full.py
 """
 from __future__ import annotations
 
@@ -53,7 +40,7 @@ def main() -> None:
     print(f"[complete_full] loading {args.input}")
     df = pd.read_csv(args.input, low_memory=False, dtype=str)  # preserve leading zeros
 
-    # --- shared early steps (identical to full/raw, keeps engineering aligned)
+    # --- shared early steps (identical in all four scripts) ------------------
     df = U.drop_error_rows(df, log)
     df = U.strip_dollars(df)
     U.check_grain_unique(df, U.ID_COL, log)
@@ -68,7 +55,7 @@ def main() -> None:
         if c in df.columns:
             base[c] = pd.to_numeric(df[c], errors="coerce")
 
-    # --- per-field builders (numeric / boolean only — identical to full) -----
+    # --- per-field builders (numeric / boolean only) -------------------------
     parts = [base]
     if "facility_type" in df.columns:
         parts.append(U.build_categorical_onehot(df["facility_type"], "facility_type"))
@@ -85,16 +72,14 @@ def main() -> None:
         parts.append(U.build_json_list(df["visits_json"], "visits", "full", log,
                                        categorical_value_keys=["announced"]))
     if "violations_json" in df.columns:
-        parts.append(U.build_json_list(df["violations_json"], "violations", "full", log))
+        parts.append(U.build_json_list(df["violations_json"], "violations", "full", log,
+                                       fetched=df["visits_json"].apply(U._has_value)))
 
     engineered = pd.concat(parts, axis=1)
 
-    # which="full" → reuse full's scaffold / discovered prefixes / exclusions /
-    # numeric cast; keep_invalid_target=True → retain unrated / out-of-range rows.
     out = U.finalize(engineered, "full", scaffold, log, keep_invalid_target=True)
 
-    # sanity: every non-id column must be numeric/boolean (qr_rating is Int64,
-    # nullable so unrated rows carry <NA> without breaking the numeric guarantee)
+    # sanity: every non-id column must be numeric/boolean
     bad = [c for c in out.columns
            if c != "provider_id" and not pd.api.types.is_numeric_dtype(out[c])
            and not pd.api.types.is_bool_dtype(out[c])

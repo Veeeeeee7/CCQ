@@ -10,14 +10,13 @@ LOG_FILE = 'ne_cleaning_log_raw.txt'
 KEY = 'provider_id'   # provider_key is renamed to provider_id in finalize
 TARGET = 'qr_rating'  # step_rating is renamed to qr_rating in finalize
 
-# Only these Step Up to Quality steps are valid; rows whose rating is anything
-# else (missing, non-numeric, out of range) are dropped by finalize().
+# Valid Step Up to Quality steps; finalize() drops any other rating.
 VALID_RATINGS = (1, 2, 3, 4, 5)
 
 # Discovered-at-runtime column families retained by finalize().
 DYNAMIC_PREFIXES = ('age_', 'info_', 'accreditation_', 'day_')
 
-# Self-reported counts arrive as text from the crawler.
+# Self-reported counts arrive as text.
 NUMERIC_COLS = ['capacity', 'full_time_staff', 'part_time_staff', 'zip_code']
 
 
@@ -46,7 +45,7 @@ def strip_dollar_prefix(series):
 if __name__ == "__main__":
     create_log_file()
     df = pd.read_csv(INPUT, dtype=str, low_memory=False)
-    log(f'loaded {len(df)} crawled facility pages')
+    log(f'loaded {len(df)} facility pages')
 
     for col in df.columns:
         if df[col].dtype == object and df[col].apply(
@@ -54,8 +53,7 @@ if __name__ == "__main__":
             df[col] = strip_dollar_prefix(df[col])
 
     # provider_key: the DHHS license number, or a synthetic STQ<facility_id> for
-    # the Head Start / public-school programs that carry no license (45 of which
-    # are rated, nearly all at the auto-entry Step 3).
+    # the Head Start / public-school programs that carry no license.
     df = u.build_provider_key(df, log=log)
 
     # Bonus attributes from the DHHS roster (left join; unmatched keep the rating).
@@ -69,7 +67,7 @@ if __name__ == "__main__":
     df, _ = u.parse_days_open(df, as_bool=False)
 
     # Multi-value text -> one text column per discovered item (the phrase where
-    # present, else NaN). Schema is discovered from the data, not hardcoded.
+    # present, else NaN).
     df, _ = u.build_multivalue_columns(df, 'age_groups', delimiter=';',
                                        prefix='age', as_bool=False)
     df, _ = u.build_multivalue_columns(df, 'other_program_info', delimiter=';',
@@ -81,11 +79,15 @@ if __name__ == "__main__":
 
     df = u.numeric_columns(df, NUMERIC_COLS)
 
-    # program_type, city and the dhhs_* text columns stay human-readable and are
-    # kept as-is via the stable scaffold in ne_columns.json.
+    # `city` and `zip_code` are in the raw scaffold only so they reach the
+    # geography stage, which drops them: NE has no region, so `county` is the
+    # single geographic field that ships.
 
     df = u.prefer_rated_order(df)
     df = u.finalize(df, COLUMNS_FILE, 'raw', KEY, TARGET, DYNAMIC_PREFIXES,
                     na_as_level=True, valid_target_values=VALID_RATINGS)
+    # prefer_rated_order() only picks the dedup survivor; restore input order
+    # so the raw and full views are row-aligned.
+    df = df.sort_index()
     df.to_csv(OUTPUT, index=False)
     log(f'wrote {len(df)} rows x {df.shape[1]} cols -> {OUTPUT}')

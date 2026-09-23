@@ -10,8 +10,7 @@ LOG_FILE = 'wi_cleaning_log_full.txt'
 KEY = 'provider_id'  # provider_location is renamed to provider_id in finalize
 TARGET = 'qr_rating'  # youngstar_star_rating is renamed to qr_rating in finalize
 
-# Only these youngstar_star_rating scores are valid; rows whose rating is
-# anything else (0, 6, 2.5, 'Not Rated', NaN, ...) are dropped by finalize().
+# Rows whose rating is anything else (0, NaN, ...) are dropped by finalize().
 VALID_RATINGS = (1, 2, 3, 4, 5)
 
 # Discovered-at-runtime boolean families retained by finalize().
@@ -34,10 +33,16 @@ if __name__ == "__main__":
     create_log_file()
     df = pd.read_csv(INPUT, low_memory=False)
 
+    # Roster-sourced fields: regulation_type from DCF's Application Type, plus
+    # capacity and age range.
+    df = u.apply_regulation_subtype(df)
+    df = u.build_roster_profile(df)
+
     # Nested JSON -> numeric counts.
     df = u.json_counts(df)
 
     # Single-value categoricals -> one-hot booleans over discovered values.
+    # regulation_type holds the DCF categories by this point.
     df, _ = u.build_categorical_onehot(df, 'regulation_type', 'regtype')
 
     # pr_program_philosophy concatenates multiple philosophies with no delimiter,
@@ -67,4 +72,5 @@ if __name__ == "__main__":
 
     df = u.finalize(df, COLUMNS_FILE, 'full', KEY, TARGET, DYNAMIC_PREFIXES,
                     valid_target_values=VALID_RATINGS)
+    df[TARGET] = df[TARGET].astype(int)
     df.to_csv(OUTPUT, index=False)

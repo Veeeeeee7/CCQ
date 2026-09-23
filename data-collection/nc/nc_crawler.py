@@ -24,6 +24,7 @@ Deps: pip install playwright pandas beautifulsoup4 && playwright install chromiu
 """
 
 import argparse
+import csv
 import json
 import os
 import random
@@ -33,6 +34,12 @@ import traceback
 
 import pandas as pd
 from bs4 import BeautifulSoup
+
+# The page parsers live in nc_data_correction.py so that the same code reads a
+# freshly fetched page here and a page already saved in nc_records.csv there.
+from nc_data_correction import (empty_scores, parse_county, parse_facility_name,
+                                parse_facility_type, parse_restrictions,
+                                parse_scores)
 
 # ---------------------------------------------------------------------------
 # configuration
@@ -231,20 +238,63 @@ def all_columns():
     return cols
 
 
-def append_row(row, output_csv):
+_HEADER_CACHE = {}
+
+
+def existing_header(output_csv):
+    """The header already on disk, or None. Cached: this is checked per row and
+    the file is large."""
+    if output_csv in _HEADER_CACHE:
+        return _HEADER_CACHE[output_csv]
+    header = None
+    if os.path.exists(output_csv) and os.path.getsize(output_csv) > 0:
+        with open(output_csv, newline='', encoding='utf-8') as fh:
+            header = next(csv.reader(fh), None)
+    _HEADER_CACHE[output_csv] = header
+    return header
+
+
+def write_columns(output_csv):
+    """The column order a row must be written in to line up with the header
+    already in the file.
+
+    A positional append under a different header silently shifts every value
+    after the first differing column. So keep the file's order if its header
+    contains every column this crawler writes (extra names stay empty), and
+    refuse to append otherwise.
+    """
     cols = all_columns()
+    header = existing_header(output_csv)
+    if header is None or header == cols:
+        return cols
+    missing = [c for c in cols if c not in header]
+    if missing:
+        raise SystemExit(
+            f'{output_csv} has a {len(header)}-column header that is missing '
+            f'{missing}, but this crawler writes {len(cols)} columns; refusing '
+            f'to append. Crawl to a new output file instead.')
+    retired = [c for c in header if c not in cols]
+    log(f'note: {output_csv} has a {len(header)}-column header from an earlier '
+        f'schema; appending under it and leaving {retired} empty.')
+    return header
+
+
+def append_row(row, output_csv):
+    parent = os.path.dirname(output_csv)
+    if parent and not os.path.exists(parent):
+        os.makedirs(parent, exist_ok=True)
+    cols = write_columns(output_csv)
     full = {}
     for c in cols:
         v = row.get(c)
         if isinstance(v, str):
             v = re.sub(r'[\r\n]+', ' ', v).strip() or None
         full[c] = v
-    parent = os.path.dirname(output_csv)
-    if parent and not os.path.exists(parent):
-        os.makedirs(parent, exist_ok=True)
-    exists = os.path.exists(output_csv) and os.path.getsize(output_csv) > 0
+    exists = existing_header(output_csv) is not None
     pd.DataFrame([full], columns=cols).to_csv(
         output_csv, mode='a', header=not exists, index=False)
+    if not exists:
+        _HEADER_CACHE[output_csv] = cols
 
 
 def load_completed(output_csv):
@@ -345,13 +395,16 @@ def crawl_star(pages):
     soup = _detail_soup(pages)
     if soup is None:
         return out
+    # The page text is read FIRST: the current-licence parsers below work on it.
+    out['star_section_text'] = _clean(soup.get_text(' '))[:8000] or None
+    page_text = out['star_section_text']
+
     types = _m_many(soup, 'lblLicenseType')
     fromd = _m_many(soup, 'lblFromDate')
     ages = _m_many(soup, 'lblAgeRange')
     cap1 = _m_many(soup, 'lblFirstShiftCapacity')
     cap2 = _m_many(soup, 'lblSecondShiftCapacity')
     cap3 = _m_many(soup, 'lblThirdShiftCapacity')
-    restr = _m_many(soup, 'lblRestriction')
 
     cur_type = types[0] if types else None
     out['license_type'] = cur_type
@@ -369,7 +422,9 @@ def crawl_star(pages):
                         _num(cap2[0]) if cap2 else None,
                         _num(cap3[0]) if cap3 else None) if c]
     out['licensed_capacity'] = str(max(caps)) if caps else (cap1[0] if cap1 else None)
-    out['license_restrictions'] = '; '.join([r for r in restr if r]) or None
+    # Every licence on the page has its own lblRestriction; only the current
+    # licence's block counts.
+    out['license_restrictions'] = parse_restrictions(page_text)
 
     # star rating: the word in the current license type ("Five Star ... License")
     if cur_type:
@@ -382,12 +437,10 @@ def crawl_star(pages):
                 out['star_rating'] = int(m2.group(1))
         # unrated (Notice of Compliance / Temporary / GS-110) stays None
 
-    scores = {k: _m_one(soup, s) for k, s in (
-        ('total_score', 'lblTotalScore'),
-        ('program_points', 'lblProgramStandardsPoints'),
-        ('program_max', 'lblProgramStandardsMaxPoints'),
-        ('education_points', 'lblEducationalStandardsPoints'),
-        ('education_max', 'lblEducationalStandardsMaxPoints'))}
+    # Read the current licence's block, not the first match on the page: a
+    # current licence with no Star Rating Information block (common on
+    # re-issues) would otherwise inherit the previous licence's points.
+    scores = parse_scores(page_text) or empty_scores()
     history = []
     for i in range(max(len(types), len(fromd), len(ages))):
         history.append({'license_type': types[i] if i < len(types) else None,
@@ -395,7 +448,6 @@ def crawl_star(pages):
                         'age_range': ages[i] if i < len(ages) else None})
     out['star_components'] = json.dumps(
         {'scores': scores, 'license_history': history}, ensure_ascii=False)
-    out['star_section_text'] = _clean(soup.get_text(' '))[:8000] or None
     return out
 
 
@@ -461,6 +513,16 @@ def crawl_details(pages):
     out['operator_name'] = _m_one(soup, 'lblOwnerName')
     out['special_features'] = _section_text_by_header(soup, 'Facility Special Features')
     out['details_section_text'] = _clean(soup.get_text(' '))[:8000] or None
+
+    # The seed has no county and a possibly stale name. Overwrite from the page
+    # only when they parse, so a markup change falls back to the seed value.
+    # Neither key is in empty_details(), so the column order is unchanged.
+    name = parse_facility_name(out['details_section_text'])
+    if name:
+        out['facility_name'] = name
+    county = parse_county(out['details_section_text'])
+    if county:
+        out['county'] = county
     return out
 
 
@@ -511,6 +573,11 @@ def crawler(records, output_csv='nc_data/nc_records.csv', headless=True,
                             row.update(empty_fn())
                             log(f'  ! {name} failed for {fid}: '
                                 f'{traceback.format_exc().splitlines()[-1]}')
+                    # The seed only guesses CCC/FCC from the name; the page
+                    # states the type and wins wherever it parses.
+                    page_type = parse_facility_type(row.get('star_section_text'))
+                    if page_type:
+                        row['facility_type'] = page_type
                     row['errors'] = ','.join(errors)
                     star = row.get('star_rating')
                     tag = 'OK' if not errors else 'PARTIAL'

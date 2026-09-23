@@ -10,15 +10,14 @@ LOG_FILE = 'ne_cleaning_log_full.txt'
 KEY = 'provider_id'   # provider_key is renamed to provider_id in finalize
 TARGET = 'qr_rating'  # step_rating is renamed to qr_rating in finalize
 
-# Only these Step Up to Quality steps are valid; rows whose rating is anything
-# else (missing, non-numeric, out of range) are dropped by finalize().
+# Valid Step Up to Quality steps; finalize() drops any other rating.
 VALID_RATINGS = (1, 2, 3, 4, 5)
 
 # Discovered-at-runtime boolean families retained by finalize().
 DYNAMIC_PREFIXES = ('age_', 'info_', 'accred_', 'day_', 'ptype_', 'lictype_',
                     'county_')
 
-# Self-reported counts arrive as text from the crawler.
+# Self-reported counts arrive as text.
 NUMERIC_COLS = ['capacity', 'full_time_staff', 'part_time_staff']
 
 
@@ -37,20 +36,17 @@ def log(message, file=LOG_FILE):
 if __name__ == "__main__":
     create_log_file()
     df = pd.read_csv(INPUT, dtype=str, low_memory=False)
-    log(f'loaded {len(df)} crawled facility pages')
+    log(f'loaded {len(df)} facility pages')
 
     # provider_key: the DHHS license number, or a synthetic STQ<facility_id> for
-    # the Head Start / public-school programs that carry no license (45 of which
-    # are rated, nearly all at the auto-entry Step 3).
+    # the Head Start / public-school programs that carry no license.
     df = u.build_provider_key(df, log=log)
 
     # Bonus attributes from the DHHS roster (left join; unmatched keep the rating).
     df = u.mark_licensing_matched(df, log=log)
 
-    # Label-prefixed DHHS blobs -> numeric scalars. Their text byproducts
-    # (dhhs_days_open, dhhs_ages_from, dhhs_hours_from, dhhs_issue_date, ...)
-    # are NOT in the full scaffold, so finalize() drops them, leaving the full
-    # set numeric/boolean only.
+    # Label-prefixed DHHS blobs -> numeric scalars; their text byproducts are
+    # not in the full scaffold, so finalize() drops them.
     df = u.parse_capacity(df)
     df = u.parse_ages(df)
     df = u.parse_hours(df)
@@ -77,5 +73,8 @@ if __name__ == "__main__":
     df = u.prefer_rated_order(df)
     df = u.finalize(df, COLUMNS_FILE, 'full', KEY, TARGET, DYNAMIC_PREFIXES,
                     valid_target_values=VALID_RATINGS)
+    # prefer_rated_order() only picks the dedup survivor; restore input order
+    # so the raw and full views are row-aligned.
+    df = df.sort_index()
     df.to_csv(OUTPUT, index=False)
     log(f'wrote {len(df)} rows x {df.shape[1]} cols -> {OUTPUT}')

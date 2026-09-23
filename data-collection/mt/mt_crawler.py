@@ -3,82 +3,36 @@ mt_crawler.py — Montana: pull the MAQCS licensing directory, join STARS rating
 
 Montana is a TWO-SOURCE state, because its rating source carries no identifier:
 
-  RATINGS  DPHHS's "STARS Program List by City" PDF (Updated 7/1/2023, 216
-           programs), transcribed into the stars_ratings half of
-           mt_data/mt_seed.csv. Columns: program_name, city, star_level,
-           program_type, ccrr_region. There is NO license number in that PDF.
+  RATINGS  DPHHS's "STARS Program List by City" PDF (Updated 7/1/2023),
+           transcribed into the stars_ratings half of mt_data/mt_seed.csv.
+           There is NO license number in that PDF.
 
-  IDS      The MAQCS licensing directory, which HAS the state's provider
-           identifier but NO star rating (confirmed from a full capture of the
-           search payload: the response objects expose only Id/pid/
-           providerNumber/providerName/providerType/street/city/county/state/
-           zipCode/phone/latitude/longitude -- no rating field, no
-           "quality"/"QRS" key anywhere). It is supplied as the
-           licensing_roster half of the same seed; this script re-pulls it from
-           the live site only when asked to.
+  IDS      The MAQCS licensing directory, which HAS the provider number but NO
+           star rating. It is the licensing_roster half of the same seed; this
+           script re-pulls it from the live site only when asked to.
 
-So provider_id is recovered by joining the 216 rated programs onto the
-licensing directory by normalized name + city. See join_ratings().
+provider_id is recovered by joining the rated programs onto the directory by
+normalized name within county. See join_ratings().
 
---- The endpoint -----------------------------------------------------------
+The "Licensed Provider Search"
+(https://mtdphhs.my.site.com/MAQCSChildCareLicensing/s/provider-search) is a
+Salesforce Experience Cloud app whose search is a plain Apex POST to
+/s/sfsites/aura, so it is replayed with `requests`, no browser. The `fwuid` and
+app version in aura.context are build fingerprints that change on every org
+redeploy, so bootstrap_context() scrapes them from the search page each run.
 
-The "Licensed Provider Search" at
-    https://mtdphhs.my.site.com/MAQCSChildCareLicensing/s/provider-search
-is a Salesforce Experience Cloud (Aura/LWC) app. A network capture showed the
-search is a plain Apex POST, so we skip the browser entirely and replay it with
-`requests` -- the playbook's preferred "API over DOM scraping" path, and the
-lightest tool that works:
+The directory is pulled county by county rather than trusting one blank
+statewide call not to be silently capped; --statewide does the single call.
 
-    POST /MAQCSChildCareLicensing/s/sfsites/aura?aura.ApexAction.execute=1
-    message      = {"actions":[{"descriptor":"aura://ApexActionController/ACTION$execute",
-                    "params":{"classname":"CC_ProviderSearchController",
-                              "method":"callApex",
-                              "params":{"wrapperData":"{...filters...}",
-                                        "tabName":"provider"}}}]}
-    aura.context = {"mode":"PROD","fwuid":<..>,"app":"siteforce:communityApp",
-                    "loaded":{"APPLICATION@markup://siteforce:communityApp":<..>}}
-    aura.token   = null      # public guest community; no auth needed
+Programs that closed or renamed since the 2023 snapshot do not match. They keep
+their rating under a synthetic id, and match_method/match_score stay on every
+row so the unmatched tail can be inspected.
 
-`fwuid` and the app version are Salesforce build fingerprints that change every
-time the org is redeployed -- hardcoding them is the classic way these scrapers
-rot. bootstrap_context() scrapes both out of the search page's own inline
-bootstrap instead, so the crawler self-heals across releases.
-
-wrapperData filters: providerName, providerNumber, county, city, zipCode (all
-optional, empty string = unfiltered). We iterate Montana's 56 counties rather
-than trusting a single blank statewide call not to be silently capped; the
-observed Yellowstone County response held 159 records with no pagination
-envelope, so a cap, if one exists, is above that and unannounced. --statewide
-does the single blank call instead, and the two can be cross-checked by
-comparing unique providerNumber counts (this is exactly how MI/CCHIRP confirmed
-its statewide export was complete).
-
-providerNumber looks like "PV109509" -- alphanumeric, so pandas won't coerce it,
-but it is read/written as a string throughout regardless (project rule: IDs are
-strings, always).
-
-providerType is one of: Child Care Center, Group Home Child Care, Family Home
-Child Care, Family/Friends & Neighbor (FFN) Providers. The STARS PDF's
-program_type is one of Center, Group, Family -- mapped in TYPE_MAP and used only
-as a tie-breaker when a name matches more than one provider, never as a filter.
-(FFN providers are license-exempt and never appear in STARS; they simply never
-match, which is correct.)
-
---- Expect an imperfect join ------------------------------------------------
-
-The ratings are a frozen 7/1/2023 snapshot; the licensing directory is live
-(2026). Programs that closed or renamed in the intervening ~3 years will not
-match and will land with an empty provider_number. That is a real, reportable
-outcome, not a bug -- the match report at the end of the run quantifies it, and
-`match_method`/`match_score` are kept on every row so the unmatched tail can be
-inspected (and, if the human wants, corrected by hand) rather than silently
-dropped.
-
+    python mt_crawler.py --join-only                       # join from the seed, no network
     python mt_crawler.py --counties Yellowstone,Missoula   # smoke test
     python mt_crawler.py                                   # full 56-county pull + join
     python mt_crawler.py --statewide                       # one blank call instead
     python mt_crawler.py --merge-only                      # rebuild providers csv from cache
-    python mt_crawler.py --join-only                       # re-run just the join
 
 Deps: pip install requests pandas
 """
@@ -92,7 +46,6 @@ import random
 import re
 import sys
 import time
-import urllib.parse
 from difflib import SequenceMatcher
 
 import pandas as pd
@@ -112,17 +65,15 @@ APEX_TAB = 'provider'
 
 OUT_DIR = 'mt_data'
 RAW_DIR = os.path.join(OUT_DIR, 'providers_raw')
-# Tabulated form of the cached directory pull. It lives with the cache rather
-# than beside the outputs because a fresh run reads its half of the seed
-# instead, and only a re-pull of the live directory rewrites it.
+# Tabulated form of the cached directory pull; only a re-pull rewrites it.
 PROVIDERS_PATH = os.path.join(RAW_DIR, 'mt_providers.csv')
 SEED_PATH = os.path.join(OUT_DIR, 'mt_seed.csv')
 RECORDS_PATH = os.path.join(OUT_DIR, 'mt_records.csv')
-# Rows the matcher would not auto-accept, with their top candidates, for a
-# human to adjudicate; copy to MANUAL_PATH once the provider_number column is
-# filled in and re-run with --join-only.
-REVIEW_PATH = 'mt_match_review.csv'
-MANUAL_PATH = 'mt_manual_matches.csv'
+# Rows the matcher would not auto-accept, with their top candidates; copy to
+# MANUAL_PATH once the provider_number column is filled in and re-run with
+# --join-only.
+REVIEW_PATH = os.path.join(OUT_DIR, 'mt_match_review.csv')
+MANUAL_PATH = os.path.join(OUT_DIR, 'mt_manual_matches.csv')
 LOG_FILE = 'mt_crawler_log.txt'
 
 UA = ('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
@@ -131,8 +82,7 @@ UA = ('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
 REQUEST_TIMEOUT = 60
 
 # The 56 Montana counties. "Lewis and Clark" is spelled out in the picklist;
-# the ampersand variant is tried as a fallback (the classic exact-match trap,
-# same one that cost MI its St. Clair / St. Joseph counties on the first run).
+# the ampersand variant is tried as a fallback.
 MT_COUNTIES = [
     'Beaverhead', 'Big Horn', 'Blaine', 'Broadwater', 'Carbon', 'Carter',
     'Cascade', 'Chouteau', 'Custer', 'Daniels', 'Dawson', 'Deer Lodge',
@@ -150,7 +100,7 @@ COUNTY_VARIANTS = {
     'Lewis and Clark': ['Lewis and Clark', 'Lewis & Clark', 'Lewis And Clark'],
 }
 
-# STARS program_type -> MAQCS providerType. Tie-breaker only.
+# STARS program_type -> MAQCS providerType. A preference, not a filter.
 TYPE_MAP = {
     'Center': 'Child Care Center',
     'Group': 'Group Home Child Care',
@@ -159,15 +109,15 @@ TYPE_MAP = {
 
 FUZZY_THRESHOLD = 0.88
 
-# Fields we keep off each MAQCS record. `pid` is an opaque per-session hash and
-# `Id` is the Salesforce row id -- neither is the licensing identifier, so both
-# are carried as metadata only.
+# Lead over the runner-up required by the cross-type retry in join_ratings().
+XTYPE_MARGIN = 0.02
+
+# `Id` is the Salesforce row id, not the licensing identifier; metadata only.
 PROVIDER_FIELDS = ['providerNumber', 'providerName', 'providerType', 'city',
                    'county', 'street', 'zipCode', 'phone', 'latitude',
                    'longitude', 'state', 'Id']
 
-# The columns each half of the seed owns. Both halves live in one file, stacked
-# and tagged by seed_source, so each carries the other's columns as blanks.
+# The columns each half of the seed owns (the halves are stacked in one file).
 RATING_FIELDS = ['program_name', 'city', 'star_level', 'program_type',
                  'ccrr_region', 'name_key', 'city_key', 'source_page']
 ROSTER_FIELDS = PROVIDER_FIELDS + ['name_key', 'city_key']
@@ -197,7 +147,7 @@ def _slug(s):
 # ---------------------------------------------------------------------------
 
 def _norm_id(v):
-    """IDs are strings, always. Guard against a stray float round-trip."""
+    """IDs are strings; guard against a stray float round-trip."""
     s = '' if v is None else str(v).strip()
     if s.endswith('.0') and s[:-2].isdigit():
         s = s[:-2]
@@ -205,9 +155,8 @@ def _norm_id(v):
 
 
 def _norm_key(s):
-    """Loose join key. Must stay byte-identical to the name_key/city_key the
-    seed already carries --
-    the two are joined on its output."""
+    """Loose join key. Must stay identical to the one that built the seed's
+    name_key/city_key."""
     s = (s or '').lower()
     s = s.replace('&', ' and ')
     s = re.sub(r"[’']", '', s)
@@ -216,11 +165,9 @@ def _norm_key(s):
     return re.sub(r'\s+', ' ', s).strip()
 
 
-# Tokens that carry no identifying signal in this domain -- essentially every
-# MT child care program contains some of them. Two names that overlap ONLY on
-# these are not the same program. This exists because a naive containment rule
-# happily matched STARS's "TLC Daycare" to a provider whose slash-split alias
-# was literally the word "Daycare" ("B Skogas/Camp Becky's Preschool/Daycare").
+# Tokens with no identifying signal in this domain. Two names that overlap ONLY
+# on these are not the same program (otherwise "TLC Daycare" matches a slash
+# alias that is literally "Daycare").
 GENERIC_TOKENS = {
     'daycare', 'day', 'childcare', 'child', 'children', 'childrens', 'care',
     'preschool', 'pre', 'school', 'center', 'centre', 'academy', 'learning',
@@ -231,8 +178,7 @@ GENERIC_TOKENS = {
 
 
 # Abbreviations the licensing registry uses that STARS spells out (or vice
-# versa). Without this, "University on Princeton" vs "S. Fischer / Univ on
-# Princeton" scores 0.85 and lands in review despite being obviously the same.
+# versa), e.g. "Univ on Princeton" vs "University on Princeton".
 ABBREV = {
     'univ': 'university',
     'ctr': 'center',
@@ -246,8 +192,7 @@ ABBREV = {
 
 
 def _stem(t):
-    """Crudest possible plural stripping. "Country Bumpkin" vs "Country
-    Bumpkins" is a real pair in this data; nothing subtler is needed."""
+    """Crude plural stripping ("Country Bumpkin" vs "Country Bumpkins")."""
     if len(t) > 3 and t.endswith('s') and not t.endswith('ss'):
         return t[:-1]
     return t
@@ -262,10 +207,8 @@ def _distinctive(s):
 
 
 def provider_name_variants(name):
-    """MAQCS family/group homes are registered as "Person Name / Business
-    Name" (e.g. "Alisa Clarke / Lisa's Kids", "Sheryl Hutzenbiler / Munchkin
-    Land"), while the STARS PDF lists only the business name. Some carry two
-    slashes. So each slash-delimited part is a candidate name in its own right,
+    """MAQCS homes are registered as "Person Name / Business Name" while STARS
+    lists only the business name, so each slash-delimited part is a candidate
     alongside the full string."""
     parts = {name}
     if '/' in name:
@@ -274,10 +217,8 @@ def provider_name_variants(name):
 
 
 def seed_name_variants(name):
-    """STARS names often append a site qualifier after a dash -- "Explorers
-    Academy - Laurel", "Kootenai Valley Head Start, Libby Center". Try the
-    bare brand too, since licensing may register only the brand (or vice
-    versa)."""
+    """STARS names often append a site qualifier ("Explorers Academy -
+    Laurel"); try the bare brand too."""
     out = {name}
     out.add(re.split(r'\s[–—-]\s', name)[0])
     out.add(name.split(',')[0])
@@ -285,11 +226,8 @@ def seed_name_variants(name):
 
 
 def score_pair(a, b):
-    """Similarity of two program names in [0,1], plus a tier label.
-
-    Requires a shared DISTINCTIVE token for any strong score -- overlap on
-    generic words alone must never produce a match.
-    """
+    """Similarity of two program names in [0,1], plus a tier label. Any
+    non-exact score requires a shared DISTINCTIVE token."""
     ta, tb = set(_tokens(a)), set(_tokens(b))
     da, db = _distinctive(a), _distinctive(b)
     if not ta or not tb:
@@ -300,17 +238,12 @@ def score_pair(a, b):
 
     shared = da & db
     if not shared:
-        # No distinctive word in common -> not the same program, whatever the
-        # raw string similarity says.
         return 0.0, 'no_shared_distinctive'
 
-    # Containment: one name's tokens are a subset of the other's, AND the
-    # shorter side contributes at least one distinctive token.
     if (ta <= tb or tb <= ta) and (da and db):
         ratio = min(len(ta), len(tb)) / max(len(ta), len(tb))
         return 0.90 + 0.05 * ratio, 'containment'
 
-    # Every distinctive token of the shorter name is present in the longer.
     if da <= db or db <= da:
         ratio = min(len(da), len(db)) / max(len(da), len(db))
         return 0.88 + 0.04 * ratio, 'distinctive_containment'
@@ -353,13 +286,8 @@ APPVER_RE = re.compile(
 
 
 def bootstrap_context(session):
-    """Scrape fwuid + the loaded app version out of the search page.
-
-    These are Salesforce build fingerprints; they change on every org
-    redeploy, and a stale pair makes the Aura endpoint reject the POST
-    (typically with an event that reads like a framework version mismatch).
-    Scraping them each run is what keeps this crawler from rotting.
-    """
+    """Scrape fwuid + the loaded app version out of the search page. A stale
+    pair makes the Aura endpoint reject the POST."""
     r = session.get(SEARCH_PAGE, timeout=REQUEST_TIMEOUT)
     r.raise_for_status()
     html = r.text
@@ -456,9 +384,8 @@ def fetch_county(session, ctx, county, force=False):
     for variant in COUNTY_VARIANTS.get(county, [county]):
         try:
             rows = apex_search(session, ctx, county=variant)
-            # An unrecognized county string returns an empty list rather than
-            # an error, so an empty result is ambiguous: genuinely-childless
-            # county, or a label miss. Try the next variant before believing it.
+            # An unrecognized county string returns an empty list, not an
+            # error, so try the next variant before believing an empty result.
             if rows:
                 with open(path, 'w', encoding='utf-8') as f:
                     json.dump(rows, f, ensure_ascii=False)
@@ -470,8 +397,6 @@ def fetch_county(session, ctx, county, force=False):
             last_err = e
             log(f'[warn] {county} variant "{variant}" failed: {e}')
 
-    # Persist the empty result so a genuinely empty county isn't re-fetched
-    # every run, but say so loudly.
     with open(path, 'w', encoding='utf-8') as f:
         json.dump([], f)
     log(f'[{county}] 0 providers (last: {last_err}) -- verify this county is '
@@ -507,10 +432,8 @@ def pull_statewide(session, ctx, force=False):
 
 
 def load_seed(path=SEED_PATH):
-    """Split the seed back into its two halves: the STARS ratings and the
-    licensing roster. They are stacked in one file and tagged by seed_source,
-    so each half carries the other's columns as blanks -- take only the columns
-    the half actually owns."""
+    """Split the seed into its two halves (STARS ratings, licensing roster),
+    each with only the columns it owns."""
     whole = pd.read_csv(path, dtype=str, keep_default_na=False)
     ratings = whole[whole['seed_source'] == 'stars_ratings'][RATING_FIELDS]
     roster = whole[whole['seed_source'] == 'licensing_roster'][ROSTER_FIELDS]
@@ -557,9 +480,8 @@ def merge_providers():
 # ---------------------------------------------------------------------------
 
 def load_manual_matches():
-    """Optional human-curated overrides, highest precedence. Columns:
-    program_name, city, provider_number. Anything listed here short-circuits
-    the matcher -- this is how the review file gets folded back in."""
+    """Optional hand-curated overrides (program_name, city, provider_number);
+    they short-circuit the matcher."""
     if not os.path.exists(MANUAL_PATH):
         return {}
     df = pd.read_csv(MANUAL_PATH, dtype=str, keep_default_na=False)
@@ -575,19 +497,19 @@ def load_manual_matches():
 def join_ratings(seed, providers):
     """One row per STARS program; attach the MAQCS providerNumber.
 
-    Scope: candidates are drawn from the seed city's COUNTY, not its city.
-    The STARS PDF's "city" is the program's mailing city, which routinely
-    disagrees with the licensing address -- "Explorers Academy - Laurel" and
-    "- Lockwood" are both filed under Billings in the PDF but licensed in
-    Laurel/Lockwood. County is derived from the licensing directory's own
-    city -> county map, with a statewide fallback for cities it doesn't know.
+    Candidates are drawn from the seed city's COUNTY (via the directory's own
+    city -> county map, statewide if the city is unknown), because the PDF's
+    city is a mailing city that often disagrees with the licensing address.
 
-    Acceptance is tiered, and deliberately conservative: a wrong provider_id
-    silently corrupts the dataset, a missing one is merely a known gap. Only
-    exact / containment matches (which require a shared distinctive token) and
-    clearly-unambiguous fuzzy matches are auto-accepted. Everything else is
-    written to mt_match_review.csv with its top candidates for a human to
-    adjudicate, and folded back in via mt_manual_matches.csv.
+    Acceptance is deliberately conservative: a wrong provider_id silently
+    corrupts the dataset, a missing one is merely a known gap. Only exact /
+    containment matches and unambiguous fuzzy matches are auto-accepted; the
+    rest go to mt_match_review.csv with their top candidates.
+
+    Program type is a PREFERENCE, not a filter. Same-type candidates are scored
+    first; if that accepts nothing and the type filter narrowed the pool, the
+    whole scope is re-scored once, accepting only exact or containment >= 0.90
+    with a >= XTYPE_MARGIN lead. Those matches are labelled `*_xtype`.
     """
     manual = load_manual_matches()
     precs = providers.to_dict('records')
@@ -618,9 +540,6 @@ def join_ratings(seed, providers):
             cands = by_county.get(county, []) if county else precs
             scope = 'county' if county else 'statewide'
 
-            # Prefer same-program-type candidates; fall back to all if that
-            # empties the pool (STARS type and licensing type disagree often
-            # enough -- e.g. Head Starts filed as Centers).
             typed = [c for c in cands if c['providerType'] == want_type]
             pool = typed if typed else cands
 
@@ -635,10 +554,22 @@ def join_ratings(seed, providers):
                 method = f'{tier}_{scope}'
             elif hit is not None and score >= FUZZY_THRESHOLD and not ambiguous:
                 method = f'fuzzy_{scope}'
-            else:
-                # Not confident. Record the top few for human adjudication.
-                # Only surface candidates that scored at all; a 0.000 row
-                # (no shared distinctive token) is noise, not a suggestion.
+            elif typed and len(typed) < len(cands):
+                # Cross-type retry: the licence may sit outside the typed pool
+                # (family homes trading as "Learning Center", Head Starts
+                # registered as Centers). Fuzzy is deliberately NOT retried;
+                # cross-type fuzzy pairs "RMDC-Valley Center" with "Valley Care
+                # Daycare".
+                h2, s2, t2, r2 = best_candidate(name, cands)
+                s2 = round(s2, 4)
+                if h2 is not None and (s2 - r2) >= XTYPE_MARGIN \
+                        and (t2 == 'exact'
+                             or (t2 == 'containment' and s2 >= 0.90)):
+                    hit, score, tier, runner = h2, s2, t2, r2
+                    method = f'{t2}_{scope}_xtype'
+
+            if method == 'unmatched':
+                # Record the top few candidates that scored at all.
                 topn = sorted(
                     ((sc, c) for sc, c in
                      ((best_candidate(name, [c])[1], c) for c in pool) if sc > 0),
@@ -652,7 +583,7 @@ def join_ratings(seed, providers):
                     **{f'cand{i+1}': (f'{c["providerName"]} [{c["providerNumber"]}] '
                                       f'({c["city"]}, {sc:.3f})')
                        for i, (sc, c) in enumerate(topn)},
-                    'provider_number': '',   # <- human fills this in
+                    'provider_number': '',
                 })
                 hit, method = None, 'needs_review'
 
@@ -678,13 +609,9 @@ def join_ratings(seed, providers):
         }
         out.append(row)
 
-    # --- duplicate-claim guard -------------------------------------------
     # A license belongs to exactly one program. When two STARS rows claim the
-    # same providerNumber, at least one is WRONG -- this is how the containment
-    # tier betrays itself on multi-site brands ("Pete's Place Child Care
-    # Center" and "Pete's Place North" both grabbing PV76597; likewise the two
-    # YMCA sites). Keep only the strongest claimant and send the rest to
-    # review rather than shipping a knowingly-wrong provider_id.
+    # same providerNumber (multi-site brands under the containment tier), keep
+    # the strongest claimant and send the rest to review.
     claims = {}
     for i, row in enumerate(out):
         if row['provider_number'] and row['match_method'] != 'manual':
@@ -728,13 +655,8 @@ def join_ratings(seed, providers):
     if n_demoted:
         log(f'[join] demoted {n_demoted} row(s) that collided on a license')
 
-    # --- synthetic ids ----------------------------------------------------
-    # Per the human's call: rather than drop the rows we could not tie to a
-    # live license (programs closed or renamed since the 7/1/2023 snapshot),
-    # mint a deterministic synthetic provider_id so no STARS rating is lost.
-    # `provider_id_source` marks which is which, so downstream analysis can
-    # exclude synthetics trivially. Prefixed "MT-" so it can never collide
-    # with a real MAQCS "PV#####" number.
+    # Rows with no live license keep their rating under a deterministic
+    # synthetic id; the "MT-" prefix can never collide with a real "PV" number.
     seen = {r['provider_number'] for r in out if r['provider_number']}
     n_synth = 0
     for row in out:
@@ -766,8 +688,7 @@ def join_ratings(seed, providers):
     log(f'[join] provider_id_source:\n'
         f'{df["provider_id_source"].value_counts().to_string()}')
 
-    # Should now be impossible (guard + synthetic minting both enforce it);
-    # assert anyway, because a duplicate provider_id silently corrupts dedup.
+    # Should be impossible; checked because a duplicate id silently corrupts dedup.
     dup = df['provider_number']
     ndup = dup.duplicated().sum()
     if ndup:
@@ -782,10 +703,12 @@ def join_ratings(seed, providers):
     if review:
         rdf = pd.DataFrame(review)
         rdf.to_csv(REVIEW_PATH, index=False)
-        log(f'\n[join] {len(rdf)} rows need human review -> {REVIEW_PATH}')
+        log(f'\n[join] {len(rdf)} rows need manual review -> {REVIEW_PATH}')
         log(f'       Fill in its `provider_number` column (blank = genuinely '
             f'absent, e.g. closed since the 7/1/2023 snapshot), save as '
             f'{MANUAL_PATH}, then re-run: python mt_crawler.py --join-only')
+        log(f'       (No {MANUAL_PATH} ships with this repository: the released '
+            f'join is what the matcher decided on its own.)')
         for r in review[:25]:
             log(f'   - {r["program_name"]!r} ({r["city"]}, STAR {r["star_level"]}) '
                 f'{r["reason"]} best={r["best_score"]} | {r.get("cand1", "-")}')

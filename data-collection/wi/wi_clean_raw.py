@@ -10,8 +10,7 @@ LOG_FILE = 'wi_cleaning_log_raw.txt'
 KEY = 'provider_id'  # provider_location is renamed to provider_id in finalize
 TARGET = 'qr_rating'  # youngstar_star_rating is renamed to qr_rating in finalize
 
-# Only these youngstar_star_rating scores are valid; rows whose rating is
-# anything else (0, 6, 2.5, 'Not Rated', NaN, ...) are dropped by finalize().
+# Rows whose rating is anything else (0, NaN, ...) are dropped by finalize().
 VALID_RATINGS = (1, 2, 3, 4, 5)
 
 # Discovered-at-runtime column families retained by finalize().
@@ -44,6 +43,11 @@ def strip_dollar_prefix(series):
 if __name__ == "__main__":
     create_log_file()
     df = pd.read_csv(INPUT, low_memory=False)
+
+    # Roster-sourced fields: regulation_type from DCF's Application Type, plus
+    # capacity and age range.
+    df = u.apply_regulation_subtype(df)
+    df = u.build_roster_profile(df)
 
     for col in df.columns:
         if df[col].dtype == object and df[col].apply(
@@ -78,16 +82,11 @@ if __name__ == "__main__":
     df = u.parse_vacancies(df, log=log)
     df = u.parse_waitlist(df, log=log)
 
-    # regulation_type is already atomic text and is kept as-is via the stable
-    # scaffold in wi_columns.json.
-
     df = u.finalize(df, COLUMNS_FILE, 'raw', KEY, TARGET, DYNAMIC_PREFIXES,
                     na_as_level=True, valid_target_values=VALID_RATINGS)
+    df[TARGET] = df[TARGET].astype(int)
 
-    # Collapse embedded newlines/carriage returns in preserved free-text cells so
-    # each provider stays on a single physical CSV line. Without this, raw's
-    # human-readable text fields inject line breaks that make raw's row count
-    # (e.g. via wc -l) diverge from full's, even though the record count matches.
+    # Keep each provider on one physical CSV line.
     for col in df.select_dtypes(include='object').columns:
         df[col] = df[col].map(
             lambda x: x.replace('\r\n', ' ').replace('\r', ' ').replace('\n', ' ')

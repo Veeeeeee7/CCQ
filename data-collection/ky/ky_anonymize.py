@@ -1,3 +1,12 @@
+"""
+ky_anonymize.py — drop identifying columns from ky_records.csv and replace
+ProviderCLRNumber with a random surrogate id.
+
+Usage:
+    python ky_anonymize.py --dry-run
+    python ky_anonymize.py
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -10,14 +19,16 @@ HERE = Path(__file__).resolve().parent
 DEFAULT_INPUT = HERE / "ky_data" / "ky_records.csv"
 DEFAULT_OUTPUT = HERE / "ky_data" / "ky_records_anonymized.csv"
 LOG_FILE = HERE / "ky_privacy_log.txt"
-MAP_PATH = HERE.parent / "private" / "provider_id_map_ky.csv"
+MAP_PATH = HERE.parent / "data-private" / "provider_id_map_ky.csv"
 
 GRAIN_COL = "ProviderCLRNumber"
 STATE_CODE = "ky"
 
-PROTECTED_COLS = ("ProviderId", "NumberOfStars")
+# Never dropped, whatever else matches. NumberOfStars is the target.
+PROTECTED_COLS = ("NumberOfStars",)
 
 PRIVATE_COLS = [
+    "ProviderId",
     "ProviderName",
     "PhoneNumber",
     "LocationAddressLine1",
@@ -42,7 +53,21 @@ def log(message: str, path: Path = LOG_FILE) -> None:
     print(message)
 
 
-def surrogate_ids(df: pd.DataFrame, state: str, seed=None) -> pd.DataFrame:
+def surrogate_ids(df: pd.DataFrame, state: str, seed=None,
+                  remint: bool = False) -> pd.DataFrame:
+    """Mint a fresh surrogate for every provider and write the map.
+
+    The permutation is unseeded, so a second run gives every provider a
+    different provider_id and loses the old map, the only link back to the
+    real licence numbers; overwriting an existing map needs --remint.
+    """
+    if MAP_PATH.exists() and not remint:
+        raise SystemExit(
+            f"{MAP_PATH} already exists. Re-running would mint a NEW random "
+            f"permutation and overwrite it, changing every provider_id in the "
+            f"release. "
+            f"Pass --remint if that is genuinely what you want.")
+
     values = df[GRAIN_COL].astype(str)
     distinct = list(dict.fromkeys(values))
     rng = np.random.default_rng(seed)
@@ -78,13 +103,14 @@ def main() -> None:
     ap.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     ap.add_argument("--dry-run", action="store_true",
                     help="report the drop list and exit without writing")
+    ap.add_argument("--remint", action="store_true",
+                    help="allow overwriting an existing provider id map, "
+                         "changing every provider_id in the release")
     args = ap.parse_args()
 
     df = pd.read_csv(args.input, low_memory=False, dtype=str,
                      keep_default_na=False)
     before = df.shape
-
-    df = surrogate_ids(df, STATE_CODE)
 
     targets = drop_targets(df.columns)
     for col, cls in targets:
@@ -94,9 +120,13 @@ def main() -> None:
         log(f"[note] {len(missing)} listed column(s) absent from this input: "
             f"{missing}")
 
+    # Return before surrogate_ids(): a dry run must not re-mint the id map.
     if args.dry_run:
-        print(f"\ndry run: would drop {len(targets)} of {before[1]} columns")
+        print(f"\ndry run: would drop {len(targets)} of {before[1]} columns; "
+              f"no id map written")
         return
+
+    df = surrogate_ids(df, STATE_CODE, remint=args.remint)
 
     out = df.drop(columns=[c for c, _ in targets], errors="ignore")
 

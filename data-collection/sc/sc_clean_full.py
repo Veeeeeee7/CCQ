@@ -10,9 +10,7 @@ LOG_FILE = 'sc_cleaning_log_full.txt'
 KEY = 'provider_id'   # permit_number is renamed to provider_id in finalize
 TARGET = 'qr_rating'  # abc_level is renamed to qr_rating in finalize
 
-# Only these ABC Quality levels are valid ratings (C=1 .. A+=5). Rows whose
-# rating is anything else -- 'P' (pending) or absent -- arrive as <NA> and are
-# dropped by finalize().
+# C=1 .. A+=5. Pending ('P') and unrated rows arrive as <NA> and are dropped.
 VALID_RATINGS = u.VALID_RATINGS
 
 # Discovered-at-runtime boolean families retained by finalize().
@@ -33,25 +31,18 @@ def log(message, file=LOG_FILE):
 
 if __name__ == "__main__":
     create_log_file()
-    # dtype=str + keep_default_na=False: permit_number is numeric-looking and
-    # must never round-trip through a float, and blank cells must stay '' rather
-    # than becoming NaN (the exempt providers are identified by a blank permit).
+    # permit_number must not round-trip through a float, and the exempt
+    # providers' blank permits must stay '' rather than NaN.
     df = pd.read_csv(INPUT, dtype=str, keep_default_na=False, low_memory=False)
 
     df = u.normalize_source_columns(df)
     df = u.synthesize_exempt_ids(df, log=log)
 
-    # Reads the *letter* abc_level, so it must run before map_rating() replaces
-    # it with the 1-5 ordinal. (add_rating_status() used to run here too; it was
-    # removed as target leakage -- see sc_cleaning_utils.LEAKAGE_COLS.)
-    df = u.recode_facility_type(df, log=log)   # collapses the leaky exempt codes
+    # Reads the letter abc_level, so it must run before map_rating().
+    df = u.recode_facility_type(df, log=log)
 
     df['abc_level'] = u.map_rating(df['abc_level'])
 
-    # Text date -> numeric recency + an explicit "was it ever inspected" flag.
-    df = u.parse_inspection_date(df, log=log)
-
-    # Categoricals -> one-hot booleans over their discovered values.
     df, _ = u.build_categorical_onehot(df, 'permit_type', 'permittype')
     df, _ = u.build_categorical_onehot(df, 'facility_type_code', 'facilitytype')
     df, _ = u.build_categorical_onehot(df, 'county', 'county')
