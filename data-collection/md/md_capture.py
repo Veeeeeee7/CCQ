@@ -1,38 +1,19 @@
 """
 md_capture.py — rendered-DOM + network-log capture for Maryland's two sites.
 
-Maryland is the first state in this dataset that needs two separate captures
-instead of one, because the rating and the base provider universe live on
-different systems:
-
   findaprogram.marylandexcels.org — the public EXCELS quality-rating finder.
-  A plain fetch of it returns almost nothing (just a language picker), so it
-  looks like results render client-side. This tool drives a real browser,
-  dumps the rendered DOM + a screenshot, and logs every XHR/fetch request and
-  response — if the site calls a clean JSON API under the hood, the network
-  log will show it, which would let md_crawler.py hit that API directly
-  instead of scraping the DOM (plan §5 prefers this when available).
+  Results render client-side; the network log shows the JSON/CSV API the Vue
+  front end calls, which md_crawler.py hits directly.
 
   checkccmd.org — MSDE's separate licensing/inspection lookup ("Check Child
-  Care Maryland"). It's an ASP.NET WebForms app: results render only after a
-  postback, not in the initial HTML — the same pattern nc_capture.py/
-  nc_crawler.py handle for NC's DCDEE portal, where the fix is to drive the
-  real UI with Playwright rather than replay the postback by hand. This tool
-  also saves the pre-search page (search_page.html) and lists its form
-  controls, just as useful context on the search fields available.
+  Care Maryland"), an ASP.NET WebForms app whose results render only after a
+  postback. The pre-search page (search_page.html) and its form controls are
+  saved and listed.
 
-Two modes, per site (selectors are unknown for BOTH sites going in, since
-this is first recon — that's the point of this script):
-
-  Interactive (default, recommended): a browser window opens on the chosen
-  site. Search manually, open a result/detail view, then press Enter in the
-  terminal to capture whatever is on screen. Repeat for a few providers —
-  see the tips printed at startup for what's worth trying — then type 'q'
-  to quit.
-
-  --query VALUE: best-effort — types VALUE into what looks like the first
-  text box and submits. This is a guess; use --manual (the default) if it
-  finds the wrong box.
+Interactive: a browser window opens on the chosen site. Search manually, open
+a result/detail view, then press Enter in the terminal to capture whatever is
+on screen; 'q' to quit. --query VALUE types VALUE into what looks like the
+first text box and submits before the interactive loop starts.
 
 Usage:
   python md_capture.py --site excels
@@ -65,23 +46,14 @@ SITES = {
     'excels': {
         'url': 'https://findaprogram.marylandexcels.org/',
         'tips': (
-            "Try, in order: (1) search a provider name you expect to exist, open "
-            "its result. (2) clear the name and search/filter by county or city "
-            "ONLY — does that return a browsable list, or does it still demand a "
-            "name? This tells us how md_crawler.py can enumerate providers. "
-            "(3) a nonsense name, to see the 'no results' state. (4) once a "
-            "provider is open, check whether the URL is a stable, bookmarkable "
-            "link with an ID in it — note it down either way."
+            "Search a provider name or filter by county, then open a result."
         ),
     },
     'checkccmd': {
         'url': 'https://www.checkccmd.org/Default.aspx',
         'tips': (
-            "Search a facility name and submit (or try the 'view all open "
-            "providers' link), then open one result to its inspection-detail "
-            "view. Note whatever ID/license number is shown — Phase 0 suggests "
-            "it may be the same number CCATS/licensing uses, possibly matching "
-            "what EXCELS shows for the same provider, but that's unconfirmed."
+            "Search a facility name and submit, then open one result to its "
+            "inspection-detail view."
         ),
     },
 }
@@ -92,14 +64,9 @@ UA = ('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
 
 
 def wait_for_render(page, selector=None, settle_ms=1500, timeout_ms=20000, poll_ms=400):
-    """Wait for the page to finish rendering after a search/navigation.
-
-    Neither site's rendering approach is confirmed yet, so default to a
-    content-settle heuristic (poll body text length, return once stable for
-    settle_ms) rather than a specific selector. Do NOT use networkidle: if
-    findaprogram turns out to hold a live connection open like WI's Blazor
-    app, networkidle would hang indefinitely.
-    """
+    """Wait for `selector`, or until body text length is stable for
+    `settle_ms`. Not networkidle, which hangs on a page holding a live
+    connection open."""
     if selector:
         page.wait_for_selector(selector, timeout=timeout_ms)
         return
@@ -120,7 +87,6 @@ def wait_for_render(page, selector=None, settle_ms=1500, timeout_ms=20000, poll_
             stable_since = None
             last_len = cur
         time.sleep(poll_ms / 1000.0)
-    # timed out — return anyway; caller still gets whatever rendered
 
 
 def save_html(page, path):
@@ -140,9 +106,7 @@ def append_manifest(out_dir, index, url, html_path):
 
 
 def _summarize_form(path):
-    """Print name/id/type of each form control in a saved page — context on
-    the search fields available, regardless of whether the eventual crawler
-    drives a real browser (likely, per NC's precedent) or posts directly."""
+    """Print name/id/type of each form control in a saved page."""
     if not os.path.exists(path):
         return
     soup = BeautifulSoup(open(path, encoding='utf-8', errors='replace').read(), 'html.parser')
@@ -170,7 +134,7 @@ def _best_effort_search(page, query):
                 return True
         except Exception:
             continue
-    print('  ! could not find a search box automatically — use --manual (the default) instead')
+    print('  ! could not find a search box automatically — search manually instead')
     return False
 
 
@@ -277,8 +241,6 @@ def _report(out_dir, network_log, n_captures):
         json_hits = [e for e in network_log if 'json' in e.get('content_type', '')]
         if json_hits:
             print(f'\n  {len(json_hits)} response(s) looked like JSON — check resp_*.txt first.')
-            print('  If these carry provider/rating data directly, md_crawler.py should hit')
-            print('  these endpoints instead of scraping the rendered DOM (plan §5).')
     else:
         print('  No XHR/fetch traffic captured — data may be server-rendered in the main')
         print('  document (check capture_*.html directly), or the session ended before any')
@@ -292,8 +254,7 @@ if __name__ == '__main__':
                     help='Best-effort: type this into the first search box before the '
                          'interactive loop starts.')
     ap.add_argument('--headless', action='store_true',
-                    help='Not recommended for the first pass — you need to see the page '
-                         'to navigate it.')
+                    help='Not recommended — you need to see the page to navigate it.')
     ap.add_argument('--wait-selector', default=None,
                     help='CSS selector to wait for instead of the settle heuristic '
                          '(set this once a stable rendered node is known).')

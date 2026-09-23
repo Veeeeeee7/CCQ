@@ -1,44 +1,30 @@
 """
-co_crawler.py — Colorado Shines search-scraper (Round 2).
+co_crawler.py — Colorado Shines search-scraper.
 
-Reads the provided co_data/co_seed.csv and, for each provider_id,
-drives the "Find a Program" search (coloradoshines.com/search) by program
-name, opens the matching program_details?id=<Salesforce id> page, and adds
-the fields that only live there: description, hours, license type/issue
-date, phone/website, languages spoken, special needs, Head Start, real-time
-openings by age band, and the 5-category licensing/violation history. The
-open-data columns from the seed are carried through unchanged; this script
-only ever *adds* columns.
+Reads the provided co_data/co_seed.csv and, for each provider_id, finds the
+provider's coloradoshines.com program_details?id=<Salesforce id> page and adds
+the fields that only live there: hours, license type/issue date, phone/website,
+languages spoken, special needs, Head Start, real-time openings by age band,
+and the 5-category licensing/violation history. The open-data columns from the
+seed are carried through unchanged; this script only ever *adds* columns.
 
-Confirmed architecture (see co_capture.py's docstring and the project chat
-for the underlying captures): Salesforce Visualforce/JSF, not Lightning --
-search is a real <form method="post" action="/search"> postback, not a
-stateless API, so this drives a real browser rather than replaying requests.
+The site is Salesforce Visualforce/JSF: the "Find a Program" search is a
+<form method="post"> postback, but the detail page is fully server-rendered.
 Detail-page fields use a consistent <strong>Label:</strong> value pattern;
-ratings (both on the results list and the detail page) are CSS-class-encoded
-(span.rating-2) when a numeric Shines level exists, or literal text "Licensed
-Program" when it doesn't.
+ratings are CSS-class-encoded (span.rating-2), or the literal text "Licensed
+Program" when there is no numeric level.
 
-Name search is NOT exact-match: searching "Discovery Link" alone returned 56
-results across 5 pages (DPS's naming isn't even internally consistent -- some
-are "DPS Discovery Link @ X", others just "Discovery Link @ X"). So this
-cannot assume the top (or only) result is correct. Disambiguation strategy,
-in order:
-  1. If there's exactly one result, use it.
-  2. If there are several, scan result cards (across up to --max-pages-scan
-     pages) for one whose visible text contains the seed row's zip code --
-     zip is a clean, format-stable string, and every seed row has one
-     (unlike street_address, which is "NA" for home-based providers).
-  3. Failing that, try a city-name match instead.
-  4. Failing that, do NOT guess: leave the new fields blank and record
-     `errors=ambiguous_no_match` with the candidate count, for manual review.
-This has only been validated against one single-result search (a Child Care
-Center) and one 56-result search (used to discover the need for step 2-4,
-not to resolve a specific provider) -- the zip/city matching logic, and
-whether it also works for home-based (FCC) providers whose street address is
-redacted on-site, needs confirming at smoke-test time.
+Name search is NOT exact-match (e.g. "Discovery Link" returns 56 results), so a
+page is accepted only once its on-page License Number equals the seed
+provider_id. Lookup order (get_provider):
+  1. licence_lookup() over plain HTTP -- the program search also matches the
+     licence number, so one GET usually returns a single card.
+  2. the Visualforce search in a real browser by sanitized program name, with
+     the candidates ranked (ZIP hit, then city hit) and probed for a licence
+     match.
+  3. if nothing verifies, the best-ranked candidate, tagged `id_mismatch`.
 
-    python co_crawler.py --limit 5                        # smoke test (visible browser)
+    python co_crawler.py --limit 5                        # quick test (visible browser)
     python co_crawler.py --headless --delay-min 2 --delay-max 5   # full run
 
 Resume-safe: re-running skips provider_ids already in the output CSV. Each
@@ -56,21 +42,19 @@ import random
 import re
 import time
 import traceback
-from urllib.parse import unquote
+from urllib.parse import quote, unquote
 
 import pandas as pd
+import requests
 from bs4 import BeautifulSoup
 
-# ---------------------------------------------------------------------------
-# configuration
-# ---------------------------------------------------------------------------
+import co_data_correction as DC
 
 BASE_URL = 'https://www.coloradoshines.com'
 SEARCH_URL = f'{BASE_URL}/search'
 
 PROGRAM_NAME_INPUT_SEL = 'input[id$=":programnamefield"]'
 SEARCH_BUTTON_SEL = 'button.search-submit'
-RESULTS_HEADING_SEL = 'h1'
 
 LOG_FILE = 'co_crawler_log.txt'
 PROFILE_DIR = 'co_data/co_profile'
@@ -80,9 +64,7 @@ UA = ('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
 
 _INIT_SCRIPT = "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });"
 
-# Substring keys for mapping the 5 licensing-history accordion titles to
-# output columns -- only "Inspection Report (ROI)" has been seen verbatim;
-# the rest are matched loosely since exact wording wasn't confirmed live.
+# Substring keys mapping the 5 licensing-history accordion titles to columns.
 LICENSING_SECTION_MAP = [
     ('inspection report', 'inspection_report_text'),
     ('complaint', 'complaints_text'),
@@ -91,10 +73,6 @@ LICENSING_SECTION_MAP = [
     ('adverse action', 'adverse_actions_text'),
 ]
 
-
-# ---------------------------------------------------------------------------
-# logging
-# ---------------------------------------------------------------------------
 
 def create_log_file(path=LOG_FILE):
     if os.path.exists(path):
@@ -108,15 +86,11 @@ def log(message, file=LOG_FILE):
     print(message)
 
 
-# ---------------------------------------------------------------------------
-# transport: Playwright driving the Visualforce search-by-name flow
-# ---------------------------------------------------------------------------
-
 class ShinesFetcher:
-    """Drives the "Find a Program" search and returns the rendered detail-page
-    DOM. One persistent browser context is reused across providers (helps
-    with any Salesforce-side bot scoring, and is simply faster than relaunching);
-    each search starts fresh at SEARCH_URL for a clean ViewState."""
+    """Drives the "Find a Program" search and returns the detail-page DOM. One
+    persistent browser context is reused across providers (helps with
+    Salesforce-side bot scoring); each search starts fresh at SEARCH_URL for a
+    clean ViewState."""
 
     def __init__(self, headless=True, user_data_dir=PROFILE_DIR):
         from playwright.sync_api import sync_playwright
@@ -157,8 +131,12 @@ class ShinesFetcher:
                 stable_since, last_len = None, cur
             time.sleep(poll_ms / 1000.0)
 
-    def get_provider(self, rec, max_pages_scan=5):
-        """Return (soup_or_None, detail_url_or_None, match_method, n_candidates)."""
+    def get_provider(self, rec, max_pages_scan=5, max_probe=5):
+        """Return (soup_or_None, detail_url_or_None, match_method, n_candidates).
+        See the module docstring for the lookup order."""
+        hit = licence_lookup(rec, max_probe=max_probe)
+        if hit[0] is not None:
+            return hit
         page = self._page()
         try:
             if not self._warmed_up:
@@ -169,7 +147,8 @@ class ShinesFetcher:
             page.goto(SEARCH_URL, wait_until='domcontentloaded')
             self._settle(page)
 
-            name = str(rec.get('provider_name') or '').strip()
+            # '&' and '+' are query operators to this search, not literals.
+            name = DC.sanitize_program_name(rec.get('provider_name'))
             box = page.locator(PROGRAM_NAME_INPUT_SEL).first
             if box.count() == 0:
                 return None, None, 'no_search_box', 0
@@ -182,6 +161,17 @@ class ShinesFetcher:
             candidates, n_total = self._collect_candidates(page, max_pages_scan)
             if n_total == 0:
                 return None, None, 'not_found', 0
+
+            # Verify BEFORE accepting: probe the ranked candidates over plain
+            # HTTP and take the first whose License Number is the seed's. If none
+            # verifies, fall back to _pick_candidate (tagged id_mismatch later).
+            for card in DC.rank_candidates(candidates, rec)[:max_probe]:
+                soup, url, status = fetch_detail(card['id'])
+                if status == 200 and soup is not None and DC.licence_matches(
+                        _after_label(soup, 'License Number'), rec.get('provider_id')):
+                    return soup, url, 'licence_verified:browser_search', n_total
+                time.sleep(0.7)
+
             chosen = self._pick_candidate(candidates, rec)
             if chosen is None:
                 return None, None, 'ambiguous_no_match', n_total
@@ -197,9 +187,8 @@ class ShinesFetcher:
             return None, None, 'exception', 0
 
     def _collect_candidates(self, page, max_pages_scan):
-        """Parse every result card on the current page, then page forward
-        (via the RichFaces AJAX page-number links) up to max_pages_scan pages
-        total, collecting all candidates. Returns (candidates, total_count)."""
+        """Collect result cards across up to max_pages_scan pages (RichFaces
+        AJAX page-number links). Returns (candidates, total_count)."""
         html = page.content()
         n_total = _parse_results_count(html)
         candidates = list(_parse_result_cards(html))
@@ -241,6 +230,109 @@ class ShinesFetcher:
             self._pw.stop()
 
 
+_HTTP_SESSION = None
+
+
+def _http():
+    """One requests.Session, same user agent as the browser context.
+
+    The detail page is fully server-rendered (a plain GET returns the same
+    fields as the browser), so candidate verification does not need a browser.
+    """
+    global _HTTP_SESSION
+    if _HTTP_SESSION is None:
+        _HTTP_SESSION = requests.Session()
+        _HTTP_SESSION.headers.update({'User-Agent': UA})
+        try:
+            from urllib3.util.retry import Retry
+            retry = Retry(total=2, backoff_factor=1.5, respect_retry_after_header=True,
+                          status_forcelist=(429, 500, 502, 503, 504),
+                          allowed_methods=frozenset(['GET']))
+            adapter = requests.adapters.HTTPAdapter(max_retries=retry)
+            _HTTP_SESSION.mount('https://', adapter)
+            _HTTP_SESSION.mount('http://', adapter)
+        except Exception:
+            pass  # retries are a courtesy; the caller handles a hard failure
+    return _HTTP_SESSION
+
+
+def http_search(term, timeout=30):
+    """Program search over plain HTTP. Returns (n_total, cards, status).
+
+    GET /search?program=<term> serves the first page of results (12 cards) as
+    ordinary HTML; later pages are only reachable by RichFaces AJAX postback.
+    """
+    url = f'{SEARCH_URL}?program=' + quote(str(term or ''))
+    resp = _http().get(url, timeout=timeout)
+    if resp.status_code != 200:
+        return 0, [], resp.status_code
+    return _parse_results_count(resp.text), _parse_result_cards(resp.text), 200
+
+
+def fetch_detail(card_id, timeout=30):
+    """Detail page over plain HTTP. Returns (soup_or_None, url, status)."""
+    url = f'{BASE_URL}/program_details?id={card_id}'
+    resp = _http().get(url, timeout=timeout)
+    if resp.status_code != 200:
+        return None, url, resp.status_code
+    return BeautifulSoup(resp.text, 'html.parser'), url, 200
+
+
+def licence_lookup(rec, max_probe=5, probe_sleep=0.7, exclude_id=None,
+                   timeout=30):
+    """The provider's own page, verified by License Number, over plain HTTP.
+
+    Returns the same 4-tuple as ShinesFetcher.get_provider:
+    (soup_or_None, detail_url_or_None, match_method, n_candidates).
+
+    Two queries, cheapest first:
+      1. search by the licence number itself (the program search matches it).
+      2. search by the sanitized program name, probe the ranked candidates and
+         accept the first page whose License Number equals the seed licence.
+         A name search that returns nothing is retried once on the first three
+         words.
+
+    A ZIP or city hit only orders the probes; it never accepts a page. If no
+    candidate verifies the result is 'not_found' (no cards) or
+    'ambiguous_no_match' (cards, none of them this provider).
+    """
+    pid = rec.get('provider_id')
+
+    def _probe(cards, method, n_total):
+        for card in cards[:max_probe]:
+            soup, url, status = fetch_detail(card['id'], timeout=timeout)
+            if status != 200 or soup is None:
+                time.sleep(probe_sleep)
+                continue
+            if DC.licence_matches(_after_label(soup, 'License Number'), pid):
+                return soup, url, method, n_total
+            time.sleep(probe_sleep)
+        return None
+
+    n_total, cards, status = http_search(DC.licence_digits(pid), timeout=timeout)
+    if status == 200 and cards:
+        hit = _probe(cards, 'licence_verified:id_search', n_total)
+        if hit:
+            return hit
+
+    name = DC.sanitize_program_name(rec.get('provider_name'))
+    n_total, cards, status = http_search(name, timeout=timeout)
+    if status == 200 and not cards:
+        prefix = DC.name_prefix(rec.get('provider_name'))
+        if prefix and prefix != name:
+            time.sleep(probe_sleep)
+            n_total, cards, status = http_search(prefix, timeout=timeout)
+    if status != 200:
+        return None, None, 'exception', 0
+    if not cards:
+        return None, None, 'not_found', n_total
+    ranked = DC.rank_candidates(cards, rec, exclude_id=exclude_id)
+    hit = _probe(ranked, 'licence_verified:name_search', n_total)
+    if hit:
+        return hit
+    return None, None, 'ambiguous_no_match', n_total
+
+
 def _parse_results_count(html):
     m = re.search(r'Results?\s*\((\d+)\)', html, re.I)
     return int(m.group(1)) if m else 0
@@ -249,15 +341,8 @@ def _parse_results_count(html):
 def _parse_result_cards(html):
     """Regex-based parse anchored on the one reliable per-card marker: the
     view-details link's aria-label. Everything between one card's link and
-    the previous one is that card's content -- avoids guessing how many
-    parent levels up a BeautifulSoup tree-walk would need to go, which isn't
-    known without live markup to test against.
-
-    The first card has no "previous card" to bound its start, so it's
-    anchored to the "Results (N)" heading instead of a fixed lookback --
-    tested against a real 56-result page where the first card alone had
-    7,300+ characters of markup before its view-details link (far more than
-    a fixed window would safely cover)."""
+    the previous one is that card's content. The first card is anchored to the
+    "Results (N)" heading instead (its markup can exceed 7,000 characters)."""
     cards = []
     pattern = re.compile(
         r'aria-label="Read more about (.*?) program"[^>]*href="([^"]*)"'
@@ -287,10 +372,6 @@ def _parse_result_cards(html):
     return cards
 
 
-# ---------------------------------------------------------------------------
-# seed loading
-# ---------------------------------------------------------------------------
-
 def load_seed(seed_csv):
     if not seed_csv or not os.path.exists(seed_csv):
         raise FileNotFoundError(
@@ -305,10 +386,6 @@ def load_seed(seed_csv):
           .drop_duplicates(subset='provider_id').reset_index(drop=True))
     return df
 
-
-# ---------------------------------------------------------------------------
-# resume helpers (rectangular CSV, append-per-row)
-# ---------------------------------------------------------------------------
 
 def append_row(row, output_csv, columns):
     full = {}
@@ -336,10 +413,6 @@ def load_completed(output_csv):
         return set()
 
 
-# ---------------------------------------------------------------------------
-# parsing helpers
-# ---------------------------------------------------------------------------
-
 def _clean(s):
     if s is None:
         return None
@@ -348,25 +421,17 @@ def _clean(s):
 
 
 def _after_label(soup, label, check_sibling=False):
-    """Value text following a <strong>Label:</strong>. Two markup patterns
-    confirmed on real pages: (1) label and value share the same parent block
-    (most fields -- License Number, Capacity, Special Needs, ...), or (2) the
-    label sits alone in its own <p class="field-label">, with the value in a
-    following sibling element (confirmed for Hours of Operation, which is a
-    <table> of day/open/close rows under a sibling .field-items div).
+    """Value text following a <strong>Label:</strong>. Two markup patterns:
+    (1) label and value share the same parent block (most fields), or (2) the
+    label sits alone in its own <p class="field-label"> with the value in a
+    following sibling (Hours of Operation).
 
-    check_sibling must be requested explicitly per label, NOT applied as a
-    blanket fallback: a real crawl surfaced a bug where a provider with a
-    genuinely EMPTY Special Needs field (no same-parent text left after
-    stripping the label -- a normal, valid state, not pattern (2)) had the
-    sibling fallback wander into the NEXT field's <p> and return "License
-    Type: Permanent" as its "special needs" value. Only pass True for a label
-    actually confirmed to use pattern (2).
+    check_sibling must be requested explicitly per label, NOT used as a blanket
+    fallback: for a genuinely empty field it would wander into the NEXT field
+    (an empty Special Needs came back as "License Type: Permanent").
 
-    Script/style content is stripped first so the one field that renders via
-    embedded JS (License Issue Date) doesn't come back full of JavaScript
-    instead of a date -- that field has its own regex fallback anyway
-    (_extract_license_issue_date)."""
+    Script/style content is stripped first so License Issue Date, which renders
+    via embedded JS, doesn't come back full of JavaScript."""
     if soup is None:
         return None
     for strong in soup.find_all('strong'):
@@ -402,9 +467,8 @@ def _after_label(soup, label, check_sibling=False):
 
 
 def _extract_rating(soup):
-    """Numeric level as a string ('1'-'5'), literal 'Licensed Program' for an
-    unrated/licensing-equivalent program, or None if the label wasn't found
-    at all (unexpected page state, worth flagging)."""
+    """Numeric level as a string ('1'-'5'), 'Licensed Program' for an unrated
+    program, or None if the label wasn't found."""
     if soup is None:
         return None
     for strong in soup.find_all('strong'):
@@ -422,10 +486,8 @@ def _extract_rating(soup):
 
 
 def _extract_license_issue_date(soup):
-    """The generic _after_label often can't reach this one (see module
-    docstring / co_capture.py notes -- it renders via an embedded Apex/JS
-    snippet). Best-effort fallback: look for a date pattern within a short
-    window after the label text in the raw page text."""
+    """This field renders via an embedded Apex/JS snippet, so _after_label
+    can't reach it; look for a date shortly after the label in the page text."""
     if soup is None:
         return None
     text = soup.get_text(' ')
@@ -462,10 +524,6 @@ def _id_mismatch(soup, provider_id):
     return bool(got_d and want_d and got_d != want_d)
 
 
-# ---------------------------------------------------------------------------
-# section extractors (empty_*/crawl_* pairs, rectangular schema)
-# ---------------------------------------------------------------------------
-
 def empty_program_info():
     return {'license_number_on_site': None, 'rating_on_site': None,
             'description': None, 'hours_of_operation': None,
@@ -494,13 +552,9 @@ def crawl_program_info(soup):
         link = field_site.find('a')
         out['website'] = _clean(link.get('href') or link.get_text()) if link \
             else _clean(field_site.get_text(' '))
-    # description: NOT reliably locatable. field-name-field-info turned out to
-    # be a generic wrapper class reused by License Number/Type/Capacity/Special
-    # Needs/etc, not a unique "bio" container -- an earlier version of this
-    # grabbed whichever of those happened to come first (wrong). Leaving this
-    # None rather than return misattributed data; a real freetext bio (seen in
-    # indexed search snippets for other providers) needs its own confirmed
-    # selector before this is filled in.
+    # description: no reliable selector (field-name-field-info is a generic
+    # wrapper shared by many fields), so it is left None rather than risk
+    # misattributed data.
     out['description'] = None
     return out
 
@@ -537,10 +591,6 @@ def crawl_licensing_history(soup):
     return _extract_licensing_sections(soup)
 
 
-# ---------------------------------------------------------------------------
-# main crawler (resume + per-section try/except + delay)
-# ---------------------------------------------------------------------------
-
 def output_columns(seed_columns):
     cols = list(seed_columns)
     for fn in (empty_program_info, empty_family_facing, empty_licensing_history):
@@ -573,6 +623,19 @@ def crawler(seed_df, output_csv='co_data/co_records.csv', headless=True,
             try:
                 soup, url, method, n_candidates = fetcher.get_provider(
                     rec, max_pages_scan=max_pages_scan)
+                if method == 'exception':
+                    # Exceptions come in contiguous runs of seed indexes -- a
+                    # browser session going bad, not bad providers. Rebuild the
+                    # context once and retry before recording the failure.
+                    log(f'  ! exception on {pid} -- rebuilding the browser '
+                        f'context and retrying once')
+                    try:
+                        fetcher.close()
+                    except Exception:
+                        pass
+                    fetcher = ShinesFetcher(headless=headless)
+                    soup, url, method, n_candidates = fetcher.get_provider(
+                        rec, max_pages_scan=max_pages_scan)
                 row['detail_url'] = url
                 row['match_method'] = method
                 row['n_candidates'] = n_candidates
@@ -627,12 +690,12 @@ def crawler(seed_df, output_csv='co_data/co_records.csv', headless=True,
 
 
 if __name__ == '__main__':
-    ap = argparse.ArgumentParser(description='Colorado Shines search-scraper (Round 2).')
+    ap = argparse.ArgumentParser(description='Colorado Shines search-scraper.')
     ap.add_argument('--seed', default='co_data/co_seed.csv',
                     help='Provider seed CSV.')
     ap.add_argument('--output', default='co_data/co_records.csv')
     ap.add_argument('--headless', action='store_true',
-                    help='Run the browser headless (use after the smoke test).')
+                    help='Run the browser headless.')
     ap.add_argument('--start-index', type=int, default=0)
     ap.add_argument('--limit', type=int, default=None)
     ap.add_argument('--delay-min', type=float, default=2)

@@ -12,7 +12,7 @@ HERE = Path(__file__).resolve().parent
 DEFAULT_INPUT = HERE / "mt_data" / "mt_records.csv"
 DEFAULT_OUTPUT = HERE / "mt_data" / "mt_records_anonymized.csv"
 LOG_FILE = HERE / "mt_privacy_log.txt"
-MAP_PATH = HERE.parent / "private" / "provider_id_map_mt.csv"
+MAP_PATH = HERE.parent / "data-private" / "provider_id_map_mt.csv"
 
 GRAIN_COL = "provider_number"
 STATE_CODE = "mt"
@@ -35,6 +35,12 @@ NAME_KEYTERMS = [
     "Lutheran",
     "Cooperative",
 ]
+
+# Abbreviations a program name may use instead of the keyterm, matched as a
+# whole slug token ("(EHS)" sets name_early_head_start, "Ehsan" does not).
+NAME_KEYTERM_ALIASES = {
+    "Early Head Start": ["EHS"],
+}
 
 PRIVATE_COLS = [
     "program_name",
@@ -75,9 +81,11 @@ def decompose_program_name(df: pd.DataFrame) -> pd.DataFrame:
                   for v in df[NAME_COL]]
     made = []
     for keyterm in NAME_KEYTERMS:
-        token = "_" + slug(keyterm) + "_"
+        tokens = ["_" + slug(t) + "_"
+                  for t in [keyterm] + list(NAME_KEYTERM_ALIASES.get(keyterm, ()))]
         column = f"{KEYTERM_PREFIX}_{slug(keyterm)}"
-        df[column] = [keyterm if token in cs else "" for cs in cell_slugs]
+        df[column] = [keyterm if any(t in cs for t in tokens) else ""
+                      for cs in cell_slugs]
         made.append(column)
     log(f"[derive] {NAME_COL} -> {len(made)} name_* keyterm column(s) "
         f"before dropping it")
@@ -118,24 +126,44 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--input", type=Path, default=DEFAULT_INPUT)
     ap.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
-    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="report what would be dropped; write nothing at all")
+    ap.add_argument("--remint", action="store_true",
+                    help="allow a fresh provider_id permutation to overwrite an "
+                         "existing id map (see the refusal message below)")
     args = ap.parse_args()
 
     df = pd.read_csv(args.input, low_memory=False, dtype=str,
                      keep_default_na=False)
     before = df.shape
 
+    targets = drop_targets(df.columns)
+
+    # --dry-run must return above surrogate_ids(), which rewrites the id map.
+    if args.dry_run:
+        for col, cls in targets:
+            print(f"[{cls}] would drop {col}")
+        print(f"\ndry run: would drop {len(targets)} of {before[1]} columns; "
+              f"nothing written, {MAP_PATH.name} untouched")
+        return
+
+    if MAP_PATH.exists() and not args.remint:
+        raise SystemExit(
+            f"refusing to overwrite {MAP_PATH}.\n"
+            f"surrogate_ids() draws a fresh random permutation, so re-running "
+            f"this script re-mints EVERY provider_id in the release and breaks "
+            f"the link to the ids already published. Montana's corrections are "
+            f"applied in place with\n"
+            f"    python mt_data_correction.py --sync-anonymized\n"
+            f"instead. Pass --remint only if you really intend a new id space."
+        )
+
     df = decompose_program_name(df)
 
     df = surrogate_ids(df, STATE_CODE)
 
-    targets = drop_targets(df.columns)
     for col, cls in targets:
         log(f"[{cls}] dropping {col}")
-
-    if args.dry_run:
-        print(f"\ndry run: would drop {len(targets)} of {before[1]} columns")
-        return
 
     out = df.drop(columns=[c for c, _ in targets], errors="ignore")
     assert len(out) == len(df), "anonymization must not change the row count"

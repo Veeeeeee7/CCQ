@@ -10,10 +10,8 @@ LOG_FILE = 'ok_cleaning_log_full.txt'
 KEY = 'provider_id'
 TARGET = 'qr_rating'  # qr_rating_raw is renamed to qr_rating in finalize
 
-# Only these Star Levels are valid (Checkpoint 0, 2026-07-07): Level 1 is
-# automatic on licensing, Levels 2-5 are voluntary, all five are real
-# published ratings. Rows whose rating is anything else (out of range,
-# non-numeric, or missing) are dropped by finalize().
+# Valid Star Levels (Level 1 is automatic on licensing, 2-5 are voluntary);
+# finalize() drops any other rating.
 VALID_RATINGS = (1, 2, 3, 4, 5)
 
 # Discovered-at-runtime boolean families retained by finalize().
@@ -37,8 +35,6 @@ if __name__ == "__main__":
     df = pd.read_csv(INPUT, low_memory=False)
 
     # Single-value categorical -> one-hot booleans over discovered values.
-    # "factype" (not "facility_type_"/"facility") is deliberately chosen so
-    # this prefix never matches the native facility_type column itself.
     df, _ = u.build_categorical_onehot(df, 'facility_type', 'factype')
 
     # Multi-value text -> presence booleans over discovered items.
@@ -51,10 +47,7 @@ if __name__ == "__main__":
     df = u.parse_hours(df, log=log)
     df = u.summarize_monitoring(df)
 
-    # Native scalar columns -> proper numeric/boolean dtypes. Their JSON/text
-    # byproducts (monitoring_visits_json, complaint_findings_json, the
-    # *_section_text columns) are NOT in the full scaffold, so finalize()
-    # drops them, leaving the full set numeric/boolean only.
+    # Native scalar columns -> proper numeric/boolean dtypes.
     df['total_capacity'] = pd.to_numeric(df['total_capacity'], errors='coerce').astype('Int64')
     df['n_monitoring_visits'] = pd.to_numeric(df['n_monitoring_visits'], errors='coerce').astype('Int64')
     df['n_complaint_findings'] = pd.to_numeric(df['n_complaint_findings'], errors='coerce').astype('Int64')
@@ -62,4 +55,5 @@ if __name__ == "__main__":
 
     df = u.finalize(df, COLUMNS_FILE, 'full', KEY, TARGET, DYNAMIC_PREFIXES,
                     valid_target_values=VALID_RATINGS)
+    df[TARGET] = df[TARGET].astype(int)
     df.to_csv(OUTPUT, index=False)

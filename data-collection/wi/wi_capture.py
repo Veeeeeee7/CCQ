@@ -1,34 +1,20 @@
 """
-Wisconsin Child Care Finder — rendered-DOM capture helper
-=========================================================
+Wisconsin Child Care Finder -- rendered-DOM capture helper.
 
-The finder (childcarefinder.wisconsin.gov) is a Blazor *Server* app: the
-initial HTML is just a bootstrap shell, and the real provider / youngstar /
-regulation / provider-reported content is pushed into the DOM over a SignalR
-websocket *after* blazor.web.js runs. A plain save-as or HTTP fetch therefore
-captures nothing useful.
+The finder is a Blazor Server app: the initial HTML is a bootstrap shell and
+the provider content arrives over a SignalR websocket after blazor.web.js runs,
+so a plain HTTP fetch captures nothing useful. This opens a real browser, waits
+for the render to settle, and dumps the rendered HTML plus a screenshot, with
+each page's URL recorded in manifest.csv.
 
-This script opens a real browser, waits for the Blazor render to settle, and
-dumps the *rendered* HTML (page.content()) plus a screenshot so the section
-selectors can be written from real markup. It also records the URL of each
-captured page to a manifest, which is how we learn the detail-page routing.
-
-Two modes:
-
-  Interactive (default): a browser window opens on the finder home page. You
-  navigate manually (search, click into a provider, open tabs/sections), then
-  press Enter in the terminal to capture whatever is currently on screen. Repeat
-  for as many providers as you like; type 'q' to quit. This is the mode to use
-  first, since we don't yet know the detail-page URL pattern — you discover it
-  by navigating and letting the manifest record the URLs.
-
-  URL list: pass --urls U1 U2 ... and each is visited and captured headlessly.
-  Use this only once you know the URL pattern.
+  Interactive (default): navigate to a provider in the browser window, then
+  press Enter in the terminal to capture it; 'q' quits.
+  URL list: --urls U1 U2 ... visits and captures each one.
 
 Usage:
-  python wi_capture.py                       # interactive, headful
+  python wi_capture.py
   python wi_capture.py --out-dir captures
-  python wi_capture.py --urls https://childcarefinder.wisconsin.gov/...   # later
+  python wi_capture.py --urls https://childcarefinder.wisconsin.gov/...
 """
 
 import argparse
@@ -48,16 +34,8 @@ UA = ('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
 
 def wait_for_render(page, selector=None, settle_ms=1500, timeout_ms=30000,
                     poll_ms=400):
-    """Wait for the Blazor app to finish rendering.
-
-    Do NOT use networkidle here: a Blazor Server app keeps a SignalR websocket
-    open, so the network never goes idle and networkidle waits would hang.
-
-    If `selector` is given, wait for that element (preferred once we know a
-    stable node in the rendered page). Otherwise fall back to a content-settle
-    heuristic: poll document.body.innerText length and return once it has been
-    unchanged for `settle_ms`.
-    """
+    """Wait for `selector`, or until body text length is unchanged for
+    `settle_ms`. Never networkidle: the SignalR websocket keeps it from idling."""
     if selector:
         page.wait_for_selector(selector, timeout=timeout_ms)
         return
@@ -80,7 +58,6 @@ def wait_for_render(page, selector=None, settle_ms=1500, timeout_ms=30000,
             stable_since = None
             last_len = cur
         time.sleep(poll_ms / 1000.0)
-    # timed out — return anyway; caller still gets whatever rendered
 
 
 def save_capture(page, out_dir, index, screenshot=True):
@@ -132,7 +109,6 @@ def run_interactive(out_dir, executable_path, wait_selector, settle_ms):
             cmd = input("[Enter]=capture current page, 'q'=quit > ").strip().lower()
             if cmd == 'q':
                 break
-            # capture whatever page/tab is frontmost
             pg = context.pages[-1] if context.pages else page
             try:
                 wait_for_render(pg, selector=wait_selector, settle_ms=settle_ms)
@@ -181,8 +157,7 @@ if __name__ == '__main__':
     ap.add_argument('--executable-path', default=None,
                     help='Path to a chromium/chrome binary, if needed.')
     ap.add_argument('--wait-selector', default=None,
-                    help='CSS selector to wait for instead of the settle heuristic '
-                         '(set this once you know a stable rendered node).')
+                    help='CSS selector to wait for instead of the settle heuristic.')
     ap.add_argument('--settle-ms', type=int, default=1500)
     args = ap.parse_args()
 
@@ -190,6 +165,5 @@ if __name__ == '__main__':
         run_urls(args.urls, args.out_dir, args.headless, args.executable_path,
                  args.wait_selector, args.settle_ms)
     else:
-        # interactive is always headful regardless of --headless
         run_interactive(args.out_dir, args.executable_path,
                         args.wait_selector, args.settle_ms)

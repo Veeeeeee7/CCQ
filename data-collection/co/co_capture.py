@@ -1,44 +1,29 @@
 """
 co_capture.py — rendered-DOM + network capture for coloradoshines.com/search.
 
-CONFIRMED by the first real capture (TINY HEART ACADEMY, provider_id 1696651):
-this runs on Salesforce VISUALFORCE, not Lightning/Aura -- the markup carries
-com.salesforce.visualforce.ViewState[MAC/Version] hidden fields, classic JSF
-auto-generated component ids (page:j_id62:j_id63:j_id65:programnamefield), and
-RichFaces/Ajax4jsf calls (A4J.AJAX.Submit(...)) for in-page sort/filter. The
-"Find a Program" search itself is a plain <form method="post" action="/search">
-full-page postback, not an isolated JSON API call -- confirmed by testing a
-stateless GET of the same URL, which came back with empty results (Visualforce
-needs the session/ViewState built up by an actual page visit). So this still
-needs a real browser; a `requests`-only crawl for the search step is not
-viable without much deeper ViewState-replay engineering that isn't worth the
-fragility. Detail pages (program_details?id=<18-char Salesforce id>) render
-with a very consistent <strong>Label:</strong> value pattern and CSS-class-
-encoded ratings (span.rating-2 etc.), so extraction there is straightforward
-once we have the id -- this script's job is mainly to confirm the search flow
-and any remaining markup questions for co_crawler.py.
+The site runs on Salesforce Visualforce, not Lightning/Aura: the markup carries
+com.salesforce.visualforce.ViewState hidden fields, JSF auto-generated
+component ids (page:j_id62:...:programnamefield) and RichFaces/Ajax4jsf calls
+(A4J.AJAX.Submit). The "Find a Program" search is a full-page
+<form method="post" action="/search"> postback that needs the session/ViewState
+of a real page visit. Detail pages (program_details?id=<18-char Salesforce id>)
+use a consistent <strong>Label:</strong> value pattern and CSS-class-encoded
+ratings (span.rating-2). This script is for checking selectors for
+co_crawler.py against real markup.
 
-The site sits on the same Salesforce backend as the "Provider Hub" login
-(decl.my.site.com), so it gets the same precautions as the WI/Blazor case in
-the playbook: persistent context, a warm-up hit to the site root, and
-navigator.webdriver patched out. (Unlike WI's Blazor Server app, this is NOT
-a persistent-websocket page -- it's a normal request/response postback -- but
-the content-settle wait is kept anyway since third-party trackers on the page
-mean networkidle may never fire.)
+Precautions: persistent context, a warm-up hit to the site root, and
+navigator.webdriver patched out. The content-settle wait is used instead of
+networkidle because third-party trackers on the page mean networkidle may never
+fire.
 
 Every time you press Enter, this captures TWO things:
   1. The rendered DOM + a screenshot of whatever page is on screen right now
-     (capture_NNN.html / .png, logged to manifest.csv) -- same idea as
-     wi_capture.py, so you can capture a search-results state, click into a
-     result, capture the detail page, then another provider, etc.
-  2. Every request/response to coloradoshines.com for the WHOLE session (not
-     just at capture time, and not just xhr/fetch -- a first pass that
-     filtered to xhr/fetch only completely missed the real search request,
-     since it's a full-page 'document' postback, not an XHR). Non-Colorado
-     hosts (Google Ads/Analytics/Amplitude/Maps -- confirmed to be 100+
-     tracking beacons carrying zero provider data) are skipped entirely so
-     the log stays readable. POST bodies get decoded into individual form
-     fields, with the giant ViewState blob redacted to a length.
+     (capture_NNN.html / .png, logged to manifest.csv).
+  2. Every request/response to coloradoshines.com for the WHOLE session, of
+     every resource type (the search is a 'document' postback, not an XHR).
+     Third-party hosts (ads/analytics/maps beacons) are skipped. POST bodies
+     are decoded into form fields, with the ViewState blob redacted to a
+     length.
 
 Usage:
   python co_capture.py
@@ -75,10 +60,8 @@ SEARCH_URL = f'{BASE_URL}/search'
 UA = ('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
       'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
 
-# Field labels already confirmed to exist on real program_details pages (from
-# indexed search snippets -- see project chat) but never seen in real markup.
-# After a capture, we grep for these as a sanity check that we reached real
-# content rather than a blocked/loading/error state.
+# Field labels expected on program_details pages; grepped for after a capture
+# as a sanity check that real content (not a blocked/loading page) was reached.
 EXPECTED_DETAIL_LABELS = [
     'Hours of Operation', 'Accepts CCCAP', 'Head Start', 'Licensed to Serve',
     'Languages Spoken', 'Special Needs', 'License Type', 'License Issue Date',
@@ -89,8 +72,8 @@ _INIT_SCRIPT = "Object.defineProperty(navigator, 'webdriver', { get: () => undef
 
 
 def wait_for_render(page, selector=None, settle_ms=1500, timeout_ms=30000, poll_ms=400):
-    """Content-settle heuristic (copied from wi_capture.py). Do NOT wait on
-    networkidle -- a Lightning/Experience Cloud page may never go idle."""
+    """Content-settle heuristic. Do NOT wait on networkidle -- the page's
+    trackers mean it may never go idle."""
     if selector:
         page.wait_for_selector(selector, timeout=timeout_ms)
         return
@@ -135,28 +118,13 @@ def append_manifest(out_dir, index, url, html_path):
 
 
 def make_network_logger(out_dir, focus_host='coloradoshines.com'):
-    """Returns (on_response handler, list that accumulates entries for the
-    whole session -- registered at the context level so it sees new tabs
-    too, e.g. if clicking a result opens the detail page in a new page).
+    """Returns (on_response handler, list accumulating entries for the whole
+    session). Registered at the context level so it also sees new tabs.
 
-    Only requests whose host contains `focus_host` are logged in detail; the
-    rest of the web is Google Ads/Analytics/Amplitude/Maps noise (confirmed
-    by an earlier capture -- 100+ tracking beacons, zero of which carried
-    any provider data) and is skipped entirely to keep this readable.
-
-    Logs EVERY resource type for the focus host, not just xhr/fetch. The
-    first real capture showed the search is a classic Visualforce <form
-    method="post" action="/search"> full-page postback (confirmed by
-    com.salesforce.visualforce.ViewState hidden fields and A4J.AJAX.Submit
-    calls in the markup) -- Playwright tags that as a 'document' navigation,
-    not 'xhr'/'fetch', so the original xhr/fetch-only filter silently missed
-    the one request that actually matters.
-
-    POST bodies get their form fields decoded and logged individually, with
-    any ViewState-ish field (the encoded server-side component-tree blob,
-    often tens of KB) redacted to a length so the log stays readable while
-    still showing exactly which real fields (program name, address, etc.)
-    were submitted.
+    Logs every resource type for `focus_host`, not just xhr/fetch: Playwright
+    tags the Visualforce search postback as a 'document' navigation. Other
+    hosts (ads/analytics/maps beacons) are skipped. ViewState-ish POST fields
+    (often tens of KB) are redacted to a length.
     """
     captured = []
     body_index = 0
@@ -280,8 +248,8 @@ def run(out_dir, executable_path, wait_selector, settle_ms):
         context.on('response', on_response)
         page = context.new_page()
 
-        # Warm-up hit to the site root before the search page -- the plan's
-        # recommendation for reCAPTCHA v3-gated Salesforce/Blazor sites.
+        # Warm-up hit to the site root before the search page (bot scoring on
+        # Salesforce sites).
         print(f'Warming up at {BASE_URL} ...')
         page.goto(BASE_URL, wait_until='domcontentloaded')
         time.sleep(2)

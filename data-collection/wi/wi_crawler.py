@@ -1,37 +1,23 @@
 """
-Wisconsin Child Care Finder crawler — Round 1 (text), selectors wired
-=====================================================================
+Wisconsin Child Care Finder crawler.
 
-Adapted from ca_crawler.py. Backbone is unchanged: one row per provider
-location, per-section try/except, resume via the output CSV, randomized delay,
-fresh context per provider.
+One row per provider-location. The finder is a Blazor Server app gated by
+reCAPTCHA v3, so pages are rendered in a real browser (persistent profile,
+never networkidle). Detail pages load from a direct URL:
+  /ProviderDetails?ProviderNumber={pn}&LocationNumber={ln}&Provider={pn}&CCF=Y
+with zero-padded IDs (e.g. ProviderNumber=0000555700, LocationNumber=001).
 
-Blazor Server specifics (see wi_capture.py for why): render in a real browser,
-never wait on networkidle, keep a polite delay + realistic UA (reCAPTCHA v3).
-
-CONFIRMED FROM THE DOM CAPTURES
--------------------------------
-Routing: /ProviderDetails?ProviderNumber={pn}&LocationNumber={ln}&Provider={pn}&CCF=Y
-  - IDs are used in zero-padded form, exactly as stored in the directory
-    (e.g. ProviderNumber=0000555700, LocationNumber=001).
-  - Live URLs also carried UserSessionId + SearchId from a search; the page
-    loads from the direct URL above without them.
-Sections are accordions with stable heading ids; star rating = count of
-span.fa-star; regulation = up to 3 desktop tables (skip .Phone duplicates);
-provider-reported = label/value under .dcf-red-font.
-
-OPEN ITEM
----------
-goto_provider() implements the direct-URL path. If the site requires a search-
-established session, fill establish_search_session() with the click/enter flow
-and set REQUIRES_SEARCH_SESSION = True.
-
-Round 1 = text (this run). Round 2 = PDF download, coded but only with --download-pdfs.
+A resume skips only rows whose `errors` cell is empty; a failed row is
+re-requested and overwritten at its own row index (replace_rows), because
+downstream files are joined to this one positionally. `--retry-errors` visits
+only the failed rows; `--dry-run` lists what would be requested and writes
+nothing. `--download-pdfs` also fetches each provider's documents.
 
 Deps: pip install playwright pandas beautifulsoup4  (and: playwright install chromium)
 """
 
 import argparse
+import csv
 import json
 import os
 import random
@@ -43,46 +29,34 @@ import pandas as pd
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
-# ---------------------------------------------------------------------------
-# configuration
-# ---------------------------------------------------------------------------
-
 BASE_URL = 'https://childcarefinder.wisconsin.gov'
 
-# Direct-URL form. IDs go in zero-padded, as stored in the directory.
 PROVIDER_URL_TEMPLATE = (BASE_URL + '/ProviderDetails'
                          '?ProviderNumber={pn}&LocationNumber={ln}&Provider={pn}&CCF=Y')
 
-# Set True if the detail page requires a search-established server session.
-# When True, establish_search_session() runs once per provider (or per batch).
+# Set True if the detail page ever requires a search-established session.
 REQUIRES_SEARCH_SESSION = False
 
-# Section accordion heading ids (stable).
 HEADING_YOUNGSTAR = 'youngstarDetailsHeading'
 HEADING_REGULATION = 'regulationDetailsHeading'
 HEADING_PROVIDER_REPORTED = 'providerReportedDetailsHeading'
 
-# Signal that the detail data has loaded. The waiting/not-found screen shares
-# the page chrome but contains NONE of the detail components — no accordion
-# sections (it shows "Active provider information was not found for: Provider
-# Number ''"). The regulation section's heading id therefore appears only once
-# the provider's data has actually rendered. (Every regulated provider — i.e.
-# every row in the seed — has a Regulation Details section.)
+# Every regulated provider has a Regulation Details section, and the
+# waiting/not-found screen has no accordion sections at all, so this heading
+# appears only once the provider's data has rendered.
 SEL_PROVIDER_LOADED = '#regulationDetailsHeading'
 
-# Max time to wait for that signal before skipping to the next provider (ms).
 PROVIDER_WAIT_MS = 60000
 
-MAX_DOCS = 60  # safety cap on documents collected per provider (Round 2)
+# Separates a provider that is really gone from a page that never rendered.
+NOT_FOUND_TEXT = 'Active provider information was not found'
+
+MAX_DOCS = 60  # safety cap on documents collected per provider
 
 UA = ('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
       'AppleWebKit/537.36 (KHTML, like Gecko) '
       'Chrome/120.0.0.0 Safari/537.36')
 
-
-# ---------------------------------------------------------------------------
-# logging
-# ---------------------------------------------------------------------------
 
 def create_log_file(path='wi_crawler_log.txt'):
     if os.path.exists(path):
@@ -95,10 +69,6 @@ def log(message, file='wi_crawler_log.txt'):
         f.write(message + '\n')
     print(message)
 
-
-# ---------------------------------------------------------------------------
-# seed list: union the licensed + certified directories
-# ---------------------------------------------------------------------------
 
 DIR_RENAME = {
     'Provider Number': 'provider_number', 'Location Number': 'location_number',
@@ -113,10 +83,8 @@ DIR_RENAME = {
 
 
 def _norm_id(series, width):
-    """Force an ID column to a zero-padded string. Robust to a source CSV that
-    stored the column as integers/floats (which drops leading zeros): casting
-    to str and zero-padding to the known width restores them — e.g. 555670 ->
-    '0000555670', 4 -> '004'. A trailing '.0' from float storage is stripped."""
+    """Force an ID column to a zero-padded string, restoring leading zeros a
+    numeric source may have dropped (555670 -> '0000555670', 4 -> '004')."""
     return (series.astype(str).str.strip()
             .str.replace(r'\.0$', '', regex=True)
             .str.replace(r'\D', '', regex=True)
@@ -135,18 +103,15 @@ def _load_one_directory(df, regulation_type):
     for c in df.columns:
         df[c] = df[c].map(lambda v: re.sub(r'\s+', ' ', v).strip()
                           if isinstance(v, str) else v)
-    # Keep IDs as strings with leading zeros preserved (provider = 10 digits,
-    # location = 3). zfill restores them even if the source dropped the zeros.
     df['provider_number'] = _norm_id(df['provider_number'], 10)
     df['location_number'] = _norm_id(df['location_number'], 3)
     return df
 
 
 def load_seed(seed_csv):
-    # The two regulation directories were stacked into one seed, tagged by
-    # seed_source. Each half kept the two-line preamble the download ships
-    # with, so the real column names sit in a row rather than in the header --
-    # find that row and promote it instead of assuming a fixed offset.
+    # The licensed and certified directories are stacked into one seed, tagged
+    # by seed_source. Each half keeps its download's two-line preamble, so find
+    # and promote each half's own header row.
     whole = pd.read_csv(seed_csv, dtype=str, keep_default_na=False)
     frames = []
     for tag, label in (('lcc', 'licensed'), ('ccc', 'certified')):
@@ -169,13 +134,18 @@ def load_seed(seed_csv):
     return df
 
 
-# ---------------------------------------------------------------------------
-# resume helpers
-# ---------------------------------------------------------------------------
+# Roster fields carried verbatim from the seed onto every crawled row (DCF's
+# own directory values, not page reads).
+SEED_CARRY = ('application_type', 'capacity', 'from_age', 'to_age')
+
+
+def seed_carry(rec):
+    return {c: rec.get(c) for c in SEED_CARRY}
+
 
 def all_columns():
     cols = ['provider_location', 'provider_number', 'location_number',
-            'facility_number', 'regulation_type', 'provider_url']
+            'facility_number', 'regulation_type', *SEED_CARRY, 'provider_url']
     for fn in (empty_youngstar, empty_regulation, empty_provider_reported,
                empty_documents):
         cols.extend(fn().keys())
@@ -183,67 +153,83 @@ def all_columns():
     return cols
 
 
+def _flat(value):
+    """One record per physical line: collapse embedded newlines in a cell."""
+    if isinstance(value, str):
+        return re.sub(r'[\r\n]+', ' ', value).strip() or None
+    return value
+
+
 def append_row(row, output_csv):
     cols = all_columns()
-    full = {}
-    for c in cols:
-        v = row.get(c)
-        if isinstance(v, str):
-            v = re.sub(r'[\r\n]+', ' ', v).strip() or None
-        full[c] = v
+    full = {c: _flat(row.get(c)) for c in cols}
     parent = os.path.dirname(output_csv)
     if parent and not os.path.exists(parent):
         os.makedirs(parent, exist_ok=True)
     exists = os.path.exists(output_csv) and os.path.getsize(output_csv) > 0
+    if exists:
+        # An append writes no header, so a layout mismatch would silently
+        # shift values between columns.
+        with open(output_csv, newline='', encoding='utf-8') as fh:
+            on_disk = next(csv.reader(fh))
+        if on_disk != cols:
+            raise ValueError(
+                f'{output_csv} has a different column layout than this crawler '
+                f'writes; refusing to append.\n  on disk: {on_disk}\n  '
+                f'expected: {cols}')
     pd.DataFrame([full], columns=cols).to_csv(
         output_csv, mode='a', header=not exists, index=False)
 
 
-def load_completed(output_csv):
+def _existing(output_csv):
+    """(provider_location -> errors) for every row already in the output."""
     if not output_csv or not os.path.exists(output_csv):
-        return set()
+        return {}
     try:
-        df = pd.read_csv(output_csv, dtype=str, usecols=['provider_location'])
-        return set(df['provider_location'].dropna().str.strip())
+        df = pd.read_csv(output_csv, dtype=str,
+                         usecols=['provider_location', 'errors'],
+                         keep_default_na=False)
     except Exception as e:
         log(f'Could not read existing {output_csv}: {e}')
-        return set()
+        return {}
+    return {str(k).strip(): str(v).strip()
+            for k, v in zip(df['provider_location'], df['errors'])}
 
 
-# ---------------------------------------------------------------------------
-# render wait + navigation
-# ---------------------------------------------------------------------------
-
-def wait_for_render(page, selector=None, settle_ms=1500, timeout_ms=30000,
-                    poll_ms=400):
-    """Blazor-safe wait. Never networkidle."""
-    if selector:
-        page.wait_for_selector(selector, timeout=timeout_ms)
-        return
-    deadline = time.time() + timeout_ms / 1000.0
-    last_len, stable_since = -1, None
-    while time.time() < deadline:
-        try:
-            cur = page.evaluate(
-                "() => (document.body && document.body.innerText || '').length")
-        except Exception:
-            cur = 0
-        if cur > 0 and cur == last_len:
-            if stable_since is None:
-                stable_since = time.time()
-            elif (time.time() - stable_since) * 1000 >= settle_ms:
-                return
-        else:
-            stable_since, last_len = None, cur
-        time.sleep(poll_ms / 1000.0)
+def replace_rows(output_csv, replacements):
+    """Rewrite output_csv with `replacements` (provider_location -> row dict)
+    substituted at the positions those providers already occupy, via a .tmp.
+    Row count and order are preserved: downstream files join positionally."""
+    if not replacements:
+        return 0
+    cols = all_columns()
+    tmp = output_csv + '.tmp'
+    written = 0
+    with open(output_csv, newline='', encoding='utf-8') as src, \
+            open(tmp, 'w', newline='', encoding='utf-8') as dst:
+        reader = csv.reader(src)
+        header = next(reader)
+        if header != cols:
+            raise ValueError(f'{output_csv} has an unexpected column layout; '
+                             f'refusing to rewrite.\n  on disk: {header}')
+        writer = csv.writer(dst)
+        writer.writerow(header)
+        key_at = header.index('provider_location')
+        for rec in reader:
+            key = rec[key_at].strip() if len(rec) > key_at else ''
+            row = replacements.get(key)
+            if row is None:
+                writer.writerow(rec)
+                continue
+            writer.writerow([_flat(row.get(c)) for c in cols])
+            written += 1
+    os.replace(tmp, output_csv)
+    return written
 
 
 def wait_for_provider(page, timeout_ms=PROVIDER_WAIT_MS):
-    """Wait until the provider's detail data has loaded, signalled by the
-    Regulation Details section appearing in the DOM. The waiting/not-found
-    screen has no such section, so this cleanly distinguishes a loaded provider
-    from a page still resolving (or a genuine miss). Returns True when it
-    appears, or False after timeout_ms so the caller skips to the next provider."""
+    """True once SEL_PROVIDER_LOADED is attached; False after timeout_ms.
+    Never networkidle: Blazor Server holds a SignalR websocket open."""
     try:
         page.wait_for_selector(SEL_PROVIDER_LOADED, state='attached', timeout=timeout_ms)
         return True
@@ -251,11 +237,20 @@ def wait_for_provider(page, timeout_ms=PROVIDER_WAIT_MS):
         return False
 
 
+def classify_load_failure(page):
+    """'not_found' if the portal says the provider is gone, else 'timeout'
+    (reCAPTCHA placeholder or slow Blazor circuit; worth requesting again)."""
+    try:
+        body = page.evaluate(
+            "() => (document.body && document.body.innerText) || ''") or ''
+    except Exception:
+        return 'timeout'
+    return 'not_found' if NOT_FOUND_TEXT.lower() in body.lower() else 'timeout'
+
+
 def establish_search_session(page, rec):
-    """★ ONLY needed if REQUIRES_SEARCH_SESSION. Fill with the search flow you
-    described (enter search criteria, submit, click the matching result) and
-    return the resulting detail URL, or None. The captured live URLs show the
-    detail page carries UserSessionId + SearchId set during search."""
+    """Only needed if REQUIRES_SEARCH_SESSION: run the search flow and return
+    the resulting detail URL (carrying UserSessionId + SearchId), or None."""
     raise NotImplementedError('Fill in the search flow, then set '
                               'REQUIRES_SEARCH_SESSION = True.')
 
@@ -267,21 +262,14 @@ def goto_provider(page, rec):
         if url and wait_for_provider(page):
             return page.url
         return None
-    # direct-URL path: the route uses the zero-padded IDs as-is, e.g.
-    # ?ProviderNumber=0000555700&LocationNumber=001&Provider=0000555700&CCF=Y
-    pn = rec['provider_number']   # padded, e.g. '0000555700'
-    ln = rec['location_number']   # padded, e.g. '001'
+    pn = rec['provider_number']
+    ln = rec['location_number']
     url = PROVIDER_URL_TEMPLATE.format(pn=pn, ln=ln)
     page.goto(url, wait_until='domcontentloaded')
-    # wait up to PROVIDER_WAIT_MS for the detail data to load; skip if it doesn't
     if not wait_for_provider(page):
         return None
     return page.url
 
-
-# ---------------------------------------------------------------------------
-# parsing helpers (operate on a BeautifulSoup of the rendered page)
-# ---------------------------------------------------------------------------
 
 def _clean(s):
     if s is None:
@@ -323,10 +311,6 @@ def _desktop_grids(body):
             out.append(t)
     return out
 
-
-# ---------------------------------------------------------------------------
-# section extractors (Round 1 = text)
-# ---------------------------------------------------------------------------
 
 def empty_youngstar():
     return {'youngstar_star_rating': None,
@@ -413,10 +397,6 @@ def crawl_provider_reported(soup):
     return out
 
 
-# ---------------------------------------------------------------------------
-# documents (Round 1 records refs; Round 2 downloads them)
-# ---------------------------------------------------------------------------
-
 DOC_PATTERNS = ('ViewMonitoringDocument', 'ViewRatingReport', 'ViewDocument')
 
 
@@ -445,8 +425,8 @@ def collect_documents(soup):
 
 
 def download_documents(page, rec, downloads_folder, docs):
-    """Round 2. Fetch each document URL in a fresh tab using the live session.
-    Only runs with --download-pdfs."""
+    """Fetch each document URL in a fresh tab using the live session
+    (--download-pdfs only)."""
     if not docs:
         return
     folder = os.path.join(downloads_folder,
@@ -464,32 +444,61 @@ def download_documents(page, rec, downloads_folder, docs):
             log(f'    ! doc download failed: {d["url"]}')
 
 
-# ---------------------------------------------------------------------------
-# main crawler
-# ---------------------------------------------------------------------------
-
 def crawler(records, output_csv='wi_data/wi_records.csv',
             downloads_folder='wi_data/downloads', headless=False, start_index=0,
             limit=None, download_pdfs=False, executable_path=None,
             channel='chrome', user_data_dir='wi_data/wi_profile',
-            delay_range=(5, 10)):
+            delay_range=(5, 10), retry_errors=False, dry_run=False):
     rows = []
-    completed = load_completed(output_csv)
-    if completed:
-        log(f'Resuming: {len(completed)} already in {output_csv} — skipping.')
+    on_disk = _existing(output_csv)
+    completed = {k for k, err in on_disk.items() if not err}
+    failed = {k for k, err in on_disk.items() if err}
+    if on_disk:
+        log(f'{len(on_disk)} row(s) already in {output_csv}: '
+            f'{len(completed)} complete, {len(failed)} carrying an error.')
+    if retry_errors:
+        wanted = failed
+        records = [r for r in records if r['provider_location'] in wanted]
+        log(f'--retry-errors: {len(records)} of {len(wanted)} failed key(s) '
+            f'found in the seed.')
+        missing = wanted - {r['provider_location'] for r in records}
+        if missing:
+            log(f'  ! {len(missing)} failed key(s) are not in this seed and '
+                f'cannot be retried: {sorted(missing)[:10]}')
+        start_index = 0
+        if limit is not None:
+            records = records[:limit]
+            log(f'  --limit {limit}: visiting the first {len(records)}.')
+            limit = None
+        if dry_run:
+            for i, r in enumerate(records):
+                log(f'  [{i}] would retry {r["provider_location"]} '
+                    f'(errors={on_disk[r["provider_location"]]!r})')
+            log(f'dry run: {len(records)} provider(s) would be requested; '
+                f'nothing was written.')
+            return pd.DataFrame(rows), start_index
+    elif dry_run:
+        todo = [r for r in records[start_index:]
+                if r['provider_location'] not in completed]
+        log(f'dry run: {len(todo)} provider(s) would be requested '
+            f'({len(failed)} of them a retry of a failed row); nothing was written.')
+        return pd.DataFrame(rows), start_index
     end = len(records) if limit is None else min(len(records), start_index + limit)
 
-    # Why a persistent profile instead of a fresh context per provider:
-    # childcarefinder is a Blazor app gated by reCAPTCHA v3 (invisible scoring).
-    # A brand-new context has zero Google cookies / trust, so it scores like a
-    # bot and the server never renders the provider data — the page stays on the
-    # empty "Provider Number ''" placeholder. A persistent profile lets that
-    # trust accumulate across the run. Combined with a real-Chrome channel and
-    # the navigator.webdriver patch below, this is what gets the data to render.
-    # If a dedicated profile still scores too low, point --user-data-dir at a
-    # COPY of your real Chrome profile (macOS:
-    # ~/Library/Application Support/Google/Chrome) — quit Chrome first, since it
-    # locks the profile.
+    # Rows already in the output are replaced at their own position, never
+    # appended; rewrite after each one so an interrupted run keeps its progress.
+    pending = {}
+
+    def flush():
+        if pending:
+            n = replace_rows(output_csv, pending)
+            log(f'  ...rewrote {n} row(s) in place')
+            pending.clear()
+
+    # Persistent profile: a fresh context has no reCAPTCHA v3 trust, scores
+    # like a bot, and the provider data never renders. If a dedicated profile
+    # still scores too low, point --user-data-dir at a COPY of a real Chrome
+    # profile (quit Chrome first; it locks the profile).
     os.makedirs(user_data_dir, exist_ok=True)
 
     with sync_playwright() as p:
@@ -499,10 +508,8 @@ def crawler(records, output_csv='wi_data/wi_records.csv',
             'viewport': {'width': 1400, 'height': 1000},
             'args': ['--disable-blink-features=AutomationControlled'],
         }
-        # Prefer a real Chrome install (channel) and let it present its own,
-        # self-consistent user-agent + client hints — spoofing only the UA
-        # string is itself a detection tell. Fall back to a spoofed UA only when
-        # running an explicit binary or Playwright's bundled Chromium.
+        # A real Chrome channel presents a self-consistent UA + client hints;
+        # spoofing only the UA string is itself a detection tell.
         if executable_path:
             launch_kwargs['executable_path'] = executable_path
             launch_kwargs['user_agent'] = UA
@@ -515,8 +522,7 @@ def crawler(records, output_csv='wi_data/wi_records.csv',
         context.add_init_script(
             "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
 
-        # Warm-up: hit the site root once so reCAPTCHA v3 executes and the
-        # profile picks up trust before we start requesting detail pages.
+        # Warm-up so reCAPTCHA v3 runs before any detail page is requested.
         try:
             warm = context.new_page()
             warm.goto(BASE_URL, wait_until='domcontentloaded')
@@ -537,11 +543,10 @@ def crawler(records, output_csv='wi_data/wi_records.csv',
                        'provider_number': rec['provider_number'],
                        'location_number': rec['location_number'],
                        'facility_number': rec.get('facility_number'),
-                       'regulation_type': rec.get('regulation_type')}
+                       'regulation_type': rec.get('regulation_type'),
+                       **seed_carry(rec)}
                 errors = []
-                # New PAGE per provider (not a new context): the persistent
-                # context is shared for the whole run so cookies / reCAPTCHA
-                # trust carry over between providers.
+                # New page, not a new context, so reCAPTCHA trust carries over.
                 page = context.new_page()
                 try:
                     url = goto_provider(page, rec)
@@ -549,8 +554,8 @@ def crawler(records, output_csv='wi_data/wi_records.csv',
                     if not url:
                         row.update(empty_youngstar() | empty_regulation()
                                    | empty_provider_reported() | empty_documents())
-                        row['errors'] = 'not_found'
-                        log(f'[{index}] NOT FOUND: {key}')
+                        row['errors'] = classify_load_failure(page)
+                        log(f'[{index}] {row["errors"].upper()}: {key}')
                     else:
                         soup = BeautifulSoup(page.content(), 'html.parser')
                         for name, fn, empty_fn in (
@@ -579,8 +584,14 @@ def crawler(records, output_csv='wi_data/wi_records.csv',
                             f"({row.get('youngstar_star_rating')}★)")
 
                     rows.append(row)
-                    append_row(row, output_csv)
-                    completed.add(key)
+                    if key in on_disk:
+                        pending[key] = row
+                        flush()
+                    else:
+                        append_row(row, output_csv)
+                    on_disk[key] = row.get('errors') or ''
+                    if not row.get('errors'):
+                        completed.add(key)
                 except Exception:
                     log(f'[{index}] EXCEPTION: {key}')
                     log(traceback.format_exc())
@@ -588,8 +599,12 @@ def crawler(records, output_csv='wi_data/wi_records.csv',
                                | empty_provider_reported() | empty_documents())
                     row['errors'] = 'exception'
                     rows.append(row)
-                    append_row(row, output_csv)
-                    completed.add(key)
+                    if key in on_disk:
+                        pending[key] = row
+                        flush()
+                    else:
+                        append_row(row, output_csv)
+                    on_disk[key] = 'exception'
                 finally:
                     try:
                         page.close()
@@ -604,12 +619,17 @@ def crawler(records, output_csv='wi_data/wi_records.csv',
             log(f'CRASHED at index {index}')
             log(traceback.format_exc())
         finally:
+            flush()
             context.close()
+    if retry_errors:
+        still = sum(1 for r in rows if r.get('errors'))
+        log(f'--retry-errors: retried {len(rows)}, recovered {len(rows) - still}, '
+            f'still failing {still}.')
     return pd.DataFrame(rows), index
 
 
 if __name__ == '__main__':
-    ap = argparse.ArgumentParser(description='WI Child Care Finder crawler (Round 1).')
+    ap = argparse.ArgumentParser(description='WI Child Care Finder crawler.')
     ap.add_argument('--seed', default='wi_data/wi_seed.csv')
     ap.add_argument('--output', default='wi_data/wi_records.csv')
     ap.add_argument('--downloads', default='wi_data/downloads')
@@ -627,6 +647,13 @@ if __name__ == '__main__':
                          "'msedge', or '' to use Playwright's bundled Chromium.")
     ap.add_argument('--delay-min', type=float, default=5)
     ap.add_argument('--delay-max', type=float, default=10)
+    ap.add_argument('--retry-errors', action='store_true',
+                    help='Visit only the providers whose existing row carries a '
+                         'non-empty errors cell, and overwrite those rows in '
+                         'place. Row count and row order are preserved.')
+    ap.add_argument('--dry-run', action='store_true',
+                    help='List the providers that would be requested and exit '
+                         'without opening a browser or writing anything.')
     args = ap.parse_args()
 
     create_log_file()
@@ -641,4 +668,5 @@ if __name__ == '__main__':
             headless=args.headless, start_index=args.start_index, limit=args.limit,
             download_pdfs=args.download_pdfs, executable_path=args.executable_path,
             channel=(args.channel or None), user_data_dir=args.user_data_dir,
-            delay_range=(args.delay_min, args.delay_max))
+            delay_range=(args.delay_min, args.delay_max),
+            retry_errors=args.retry_errors, dry_run=args.dry_run)

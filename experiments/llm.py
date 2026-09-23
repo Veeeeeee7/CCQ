@@ -1,12 +1,7 @@
-"""ModernBERT for within-state prediction, plus the shared HuggingFace plumbing.
+"""ModernBERT within-state (5-fold CV on the serialized text), plus the shared
+HuggingFace Trainer plumbing used by the cross-state text and LLM methods.
 
-Supplies the MBERT arm of the within-state experiment, running 5-fold CV over the
-shared fold indices on the serialized text view. Also houses the Trainer plumbing
-(`make_training_arguments`, `make_best_model_keeper`, `predict_with_labels`, the
-class-weighted Trainer subclass) that the cross-state text and LLM methods import.
-
-    python llm.py --input data/wi_records_cleaned_raw.csv --output results.csv
-    python llm.py --models bert_textualized_full --compliance verbose
+    python llm.py --input data/wi_records_cleaned_raw.csv --remap-state WI --rating-scale 5star
 """
 from __future__ import annotations
 
@@ -38,11 +33,15 @@ from utils import (  # noqa: E402
     load_data,
     maybe_remap,
     log_results,
+    resolve_output,
+    setup_logging,
 )
 
 
+_SCRIPT = "llm"
+
+
 def _detect_device() -> str:
-    """Pick the best available accelerator. Priority: cuda → mps → cpu."""
     if torch.cuda.is_available():
         return "cuda"
     if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
@@ -51,8 +50,7 @@ def _detect_device() -> str:
 
 
 DEVICE = _detect_device()
-# bf16 where supported, else fp16 on CUDA, else full precision.
-# Override with CCQ_PLM_PRECISION=bf16|fp16|off.
+# Mixed precision on CUDA; override with CCQ_PLM_PRECISION=bf16|fp16|off.
 _prec = os.environ.get("CCQ_PLM_PRECISION", "").lower()
 if not _prec:
     if DEVICE == "cuda":
@@ -61,39 +59,32 @@ if not _prec:
         _prec = "off"
 USE_BF16 = (DEVICE == "cuda" and _prec == "bf16")
 USE_FP16 = (DEVICE == "cuda" and _prec == "fp16")
-# 0 workers on MPS to avoid macOS fork/multiprocessing issues.
 NUM_WORKERS = 0 if DEVICE == "mps" else int(os.environ.get("CCQ_PLM_WORKERS", "4"))
 MODEL_NAME = "answerdotai/ModernBERT-base"
-MAX_LEN = 8192      # ModernBERT's full window
-# The train batch is an optimization hyperparameter and changes results; the
-# eval batch affects speed only.
+MAX_LEN = 8192
+# The train batch changes results; the eval batch affects speed only.
 BATCH_SIZE = int(os.environ.get("CCQ_PLM_BATCH", "8"))
 EVAL_BATCH_SIZE = int(os.environ.get("CCQ_PLM_EVAL_BATCH", "16"))
-# Sort-by-length batching, to limit padding waste at 8k context.
 GROUP_BY_LENGTH = os.environ.get("CCQ_PLM_GROUP_BY_LENGTH", "1") == "1"
 EPOCHS = 4
 LR = 2e-5
 WARMUP_RATIO = 0.1
-# Fraction of each training fold held out for early stopping.
-VAL_FRAC = 0.15
-# TF32 matmuls on Ampere+.
+VAL_FRAC = 0.15  # early-stopping slice of each training fold
 if DEVICE == "cuda":
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
 
 # -----------------------------------------------------------------------------
-# Version-tolerant TrainingArguments
+# Version-tolerant Trainer arguments
 # -----------------------------------------------------------------------------
-# Drops kwargs the installed transformers does not accept, but only those on the
-# performance-only allow-list below. Anything that would change training
-# semantics still raises.
-_TA_DROPPABLE = {"group_by_length", "dataloader_num_workers"}  # perf-only knobs
+# Kwargs the installed transformers lacks are dropped only if they cannot change
+# training results.
+_TA_DROPPABLE = {"group_by_length", "dataloader_num_workers"}
 
 
 def trainer_tokenizer_kwarg(tokenizer) -> dict:
-    """Return the tokenizer kwarg under whichever name the installed Trainer
-    accepts (`processing_class` or `tokenizer`)."""
+    """The tokenizer kwarg under the name the installed Trainer accepts."""
     import inspect
     from transformers import Trainer
     params = inspect.signature(Trainer.__init__).parameters
@@ -120,12 +111,9 @@ def make_training_arguments(**kwargs):
     return TrainingArguments(**kwargs)
 
 
-# -----------------------------------------------------------------------------
-# Token-length diagnostics.
-# -----------------------------------------------------------------------------
 def report_token_lengths(texts: pd.Series, tokenizer, label: str) -> None:
     lens = [len(tokenizer.encode(t, add_special_tokens=True, truncation=False))
-            for t in texts.head(min(len(texts), 500))]  # sample for speed
+            for t in texts.head(min(len(texts), 500))]
     lens = np.array(lens)
     pct_over = float((lens > MAX_LEN).mean()) * 100
     print(
@@ -136,9 +124,6 @@ def report_token_lengths(texts: pd.Series, tokenizer, label: str) -> None:
     )
 
 
-# -----------------------------------------------------------------------------
-# Dataset wrapper: tokenize once per fold.
-# -----------------------------------------------------------------------------
 class _TextDataset(torch.utils.data.Dataset):
     def __init__(self, encodings: dict, labels: np.ndarray):
         self.encodings = encodings
@@ -153,16 +138,11 @@ class _TextDataset(torch.utils.data.Dataset):
         return item
 
 
-# -----------------------------------------------------------------------------
-# Ordered predict, shared with the transfer modules.
-# -----------------------------------------------------------------------------
 def predict_with_labels(trainer, dataset):
-    """Run ``trainer.predict`` and return ``(logits, label_ids)`` as paired by the
-    Trainer.
+    """Return ``(logits, label_ids)`` as paired by the Trainer.
 
-    Prediction order is sampler-dependent, so ``.predictions`` must never be
-    zipped against a caller-held label array. ``label_ids`` comes through the same
-    dataloader and is therefore correctly aligned under any sampler.
+    Prediction order depends on the sampler (``group_by_length`` also sorts eval
+    batches), so predictions must never be zipped against a caller-held label array.
     """
     out = trainer.predict(dataset)
     if out.label_ids is None:
@@ -172,12 +152,8 @@ def predict_with_labels(trainer, dataset):
     return np.asarray(out.predictions), np.asarray(out.label_ids)
 
 
-# -----------------------------------------------------------------------------
-# Class-weighted Trainer
-# -----------------------------------------------------------------------------
 def _make_weighted_trainer_class(class_weights: torch.Tensor):
-    """Build a Trainer subclass using class-weighted CE, constructed per fold so
-    the weights match the train fold's label distribution."""
+    """Trainer subclass with class-weighted cross-entropy."""
     from transformers import Trainer
 
     class WeightedTrainer(Trainer):
@@ -195,18 +171,10 @@ def _make_weighted_trainer_class(class_weights: torch.Tensor):
     return WeightedTrainer
 
 
-# -----------------------------------------------------------------------------
-# Best-model-in-RAM keeper (shared with transfer_plm.py)
-# -----------------------------------------------------------------------------
 def make_best_model_keeper(metric: str = "eval_qwk",
                            greater_is_better: bool = True, patience: int = 2):
-    """TrainerCallback that keeps the best epoch's weights in CPU RAM and stops
-    after ``patience`` non-improving evals.
-
-    Lets the Trainer run with ``save_strategy="no"``, at the cost of one model's
-    worth of CPU RAM. The caller restores ``keeper.best_state`` after
-    ``trainer.train()``. Imported lazily to keep importing this module cheap.
-    """
+    """Callback that keeps the best epoch's weights in CPU RAM and stops after
+    ``patience`` non-improving evals. The caller restores ``keeper.best_state``."""
     from transformers import TrainerCallback
 
     class _BestModelInRAM(TrainerCallback):
@@ -222,7 +190,7 @@ def make_best_model_keeper(metric: str = "eval_qwk",
             if metrics is None or model is None:
                 return
             val = metrics.get(self.metric)
-            if val is None:  # tolerate an un-prefixed key just in case
+            if val is None:
                 val = metrics.get(self.metric.removeprefix("eval_"))
             if val is None:
                 return
@@ -241,9 +209,6 @@ def make_best_model_keeper(metric: str = "eval_qwk",
     return _BestModelInRAM()
 
 
-# -----------------------------------------------------------------------------
-# Single fold
-# -----------------------------------------------------------------------------
 def _train_one_fold(
     fold_idx: int,
     train_texts: list[str],
@@ -258,20 +223,14 @@ def _train_one_fold(
     score_texts: "list[str] | None" = None,
     score_labels: "np.ndarray | None" = None,
 ) -> dict:
-    """Fine-tune ModernBERT for one fold; return metrics on the scored block.
-
-    `val_*` is the early-stopping slice. `score_*`, when given, is the disjoint
-    block the metrics are computed on; when omitted the two coincide.
-    """
+    """Fine-tune ModernBERT, early-stop on `val_*`, return metrics on `score_*`."""
     import shutil
 
     from transformers import (
         AutoModelForSequenceClassification,
-        TrainingArguments,
         DataCollatorWithPadding,
     )
 
-    # Pre-tokenize once per fold (small dataset; no benefit to per-epoch).
     train_enc = tokenizer(
         train_texts, truncation=True, padding=False, max_length=MAX_LEN,
     )
@@ -281,11 +240,7 @@ def _train_one_fold(
     train_ds = _TextDataset(train_enc, train_labels)
     val_ds = _TextDataset(val_enc, val_labels)
 
-    # Per-fold class weights (balanced, computed on train labels only).
-    # compute_class_weight errors if any class in `classes` is absent from y,
-    # which happens when a fold's train set misses an ultra-rare ordinal class
-    # (WI 5-star 1-star: 2 providers total). Weight only the classes actually
-    # present and leave absent classes at weight 1.0, so the model still trains.
+    # Balanced weights; a class absent from this fold keeps weight 1.0.
     train_labels_arr = np.asarray(train_labels)
     present = np.unique(train_labels_arr)
     cw_present = compute_class_weight(
@@ -314,15 +269,10 @@ def _train_one_fold(
         warmup_ratio=WARMUP_RATIO,
         weight_decay=0.01,
         eval_strategy="epoch",
-        # Write NOTHING to disk during training. Best-epoch selection (by val QWK)
-        # and patience-2 early stopping are handled entirely in CPU RAM by the
-        # keeper below. Checkpointing per epoch would write roughly 0.6 GB each
-        # time, so a 5-fold run would leave several GB on the scratch quota for a
-        # model that is reloaded from RAM anyway.
-        save_strategy="no",
+        save_strategy="no",  # best epoch is kept in RAM by the keeper
         logging_steps=50,
         seed=SEED,
-        report_to=[],          # no wandb / tensorboard by default
+        report_to=[],
         dataloader_num_workers=NUM_WORKERS,
         fp16=USE_FP16,
         bf16=USE_BF16,
@@ -330,8 +280,6 @@ def _train_one_fold(
 
     collator = DataCollatorWithPadding(tokenizer=tokenizer)
 
-    # compute_metrics adapter for HF Trainer: map back to ordinal labels and
-    # softmax the logits to get probabilities for log_loss.
     def _hf_compute_metrics(eval_pred):
         logits, labels = eval_pred
         logits = np.asarray(logits)
@@ -363,13 +311,9 @@ def _train_one_fold(
         warnings.simplefilter("ignore")
         trainer.train()
 
-    # Restore the best-on-val weights (kept in RAM, never on disk) before scoring.
     if keeper.best_state is not None:
         model.load_state_dict(keeper.best_state)
 
-    # Score on the held-out CV fold, which the early-stopping slice is disjoint
-    # from. Falls back to the early-stopping set only when no scoring block was
-    # supplied.
     if score_texts is not None:
         score_enc = tokenizer(
             score_texts, truncation=True, padding=False, max_length=MAX_LEN,
@@ -379,7 +323,6 @@ def _train_one_fold(
         score_ds = val_ds
 
     eval_out = trainer.evaluate(eval_dataset=score_ds)
-    # HF prefixes keys with 'eval_'; strip and keep only our metric keys.
     metric_keys = {"accuracy", "balanced_acc", "macro_f1", "micro_f1",
                    "qwk", "mae", "log_loss"}
     m = {k.removeprefix("eval_"): v for k, v in eval_out.items()
@@ -390,15 +333,10 @@ def _train_one_fold(
         torch.cuda.empty_cache()
     elif DEVICE == "mps" and hasattr(torch.mps, "empty_cache"):
         torch.mps.empty_cache()
-    # With save_strategy="no" this dir holds at most a few KB of run metadata,
-    # but drop it so nothing lingers under the scratch tree.
     shutil.rmtree(out_dir, ignore_errors=True)
     return m
 
 
-# -----------------------------------------------------------------------------
-# Runners
-# -----------------------------------------------------------------------------
 def _run_plm_cv(
     df: pd.DataFrame,
     folds: list[dict],
@@ -406,8 +344,7 @@ def _run_plm_cv(
     label: str,
     models_dir: Path,
 ) -> list[dict]:
-    """Generic 5-fold runner. `texts` is one string per row of df; splits are
-    positional indices from the shared folds."""
+    """5-fold CV over the shared folds; `texts` holds one string per row of `df`."""
     from transformers import AutoTokenizer
 
     n_classes = df[TARGET_COL].nunique()
@@ -432,12 +369,7 @@ def _run_plm_cv(
         fold_idx = fold["fold"]
         train_idx, val_idx = fold["train_idx"], fold["val_idx"]
 
-        # INNER EARLY-STOPPING SPLIT. A stratified VAL_FRAC slice is carved out
-        # of the TRAINING fold and used for model selection; val_idx is untouched
-        # until scoring. Selecting the best epoch on the scored fold would bias
-        # its reported metrics optimistically.
-        # Imported lazily: transfer_common pulls in the whole transfer CLI
-        # surface, and llm.py is imported by within-state-only entry points.
+        # Early stopping uses a slice of the training fold, never the scored fold.
         from transfer_common import stratified_source_split
         train_idx = np.asarray(train_idx)
         inner_tr, inner_va = stratified_source_split(
@@ -484,34 +416,17 @@ def _run_plm_cv(
     return fold_metrics
 
 
-def run_curriculum_only(
-    df: pd.DataFrame, folds: list[dict], models_dir: Path, **_
-) -> list[dict]:
-    """Just the raw curriculum cell as input. NaN/empty → empty string."""
-    if "curriculum" not in df.columns:
-        raise KeyError("Expected a 'curriculum' column in the raw dataframe.")
-    texts = df["curriculum"].fillna("").astype(str)
-    empty = (texts.str.strip() == "").mean()
-    print(f"  curriculum-only: {empty:.1%} of rows have empty curriculum text.")
-    return _run_plm_cv(df, folds, texts, "bert_curriculum_only", models_dir)
-
-
 def run_textualized_full(
     df: pd.DataFrame, folds: list[dict], models_dir: Path,
     compliance_mode: str = "verbose",
 ) -> list[dict]:
-    """Full row serialization (sections + skip-defaults)."""
     print(f"  textualizing rows (compliance_mode={compliance_mode!r})...")
     texts = serialize_dataframe(df, compliance_mode=compliance_mode)
     return _run_plm_cv(df, folds, texts,
                        f"bert_textualized_full_{compliance_mode}", models_dir)
 
 
-# -----------------------------------------------------------------------------
-# Main
-# -----------------------------------------------------------------------------
 MODEL_RUNNERS: dict[str, Callable] = {
-    "bert_curriculum_only":  run_curriculum_only,
     "bert_textualized_full": run_textualized_full,
 }
 
@@ -522,35 +437,32 @@ def main() -> None:
     parser.add_argument(
         "--models",
         nargs="+",
-        default=["bert_curriculum_only", "bert_textualized_full"],
+        default=["bert_textualized_full"],
         choices=list(MODEL_RUNNERS.keys()),
-        help="Which run(s) to execute",
     )
     parser.add_argument(
         "--compliance",
         choices=("verbose", "summary", "abnormal_only"),
         default="verbose",
-        help="Compliance section rendering for textualized_full (default verbose). "
-             "Switch to 'summary' if verbose underperforms.",
+        help="Rendering of the compliance section (default verbose).",
     )
     args = parser.parse_args()
     configure_verbosity(args.verbose)
+    _st = (args.remap_state or "all").lower()
+    args.output = resolve_output(args, "within_state",
+                                 f"experiment_within_state_{_st}_results.csv")
+    setup_logging(args, "within_state", f"{_SCRIPT}_{_st}")
 
     df = load_data(args.input)
     df = maybe_remap(df, args.remap_state, allow_identity=args.allow_identity, scale=args.rating_scale)
     folds = get_folds(df, folds_path=args.folds)
 
-    # Fine-tuned checkpoints land next to the results file.
     models_dir = run_artifact_dir(args.output) / "plm_models"
 
     for model_name in args.models:
-        runner = MODEL_RUNNERS[model_name]
-        if model_name == "bert_textualized_full":
-            fold_results = runner(df, folds, models_dir, compliance_mode=args.compliance)
-            log_name = f"bert_textualized_full_{args.compliance}"
-        else:
-            fold_results = runner(df, folds, models_dir)
-            log_name = model_name
+        fold_results = MODEL_RUNNERS[model_name](
+            df, folds, models_dir, compliance_mode=args.compliance)
+        log_name = f"{model_name}_{args.compliance}"
         log_results(log_name, fold_results, output_path=args.output, notes=log_name)
 
     print(f"\nDone. See {args.output} for aggregated scores.")

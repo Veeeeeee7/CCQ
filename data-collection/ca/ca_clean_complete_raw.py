@@ -1,22 +1,11 @@
 """
-clean_complete_raw.py — Build the `complete_raw` dataset: identical to `raw`
-(text preserved and maximally decomposed, for LLM-based methods), but it KEEPS
-rows whose quality rating is invalid (out of 1..5) or missing instead of
-dropping them.
+ca_clean_complete_raw.py — Build the `complete_raw` view: identical to `raw`,
+but it KEEPS rows whose rating is invalid (out of 1..5) or missing.
 
-Row-aligned with complete_full.csv: same source, same error-row filter, same
-dedup, and the same (no-op) target filter, so one set of CV folds applies to
-both. The valid `raw` set is a row subset of this `complete_raw` set:
-raw == complete_raw with the non-1..5 rows removed.
+qr_rating here holds 1..5 for rated facilities, any out-of-range numeric score
+as-is, and <NA> for the '-' sentinel / non-numeric / missing ratings.
 
-The target column qr_rating here contains: 1..5 for properly rated facilities,
-any out-of-range numeric score preserved as-is (e.g. a stray 7), and <NA> for
-the '-' sentinel / non-numeric / missing ratings.
-
-    python clean_complete_raw.py \
-        --input facility_records_sample.csv \
-        --output complete_raw.csv \
-        --scaffold columns_scaffold.json
+    python ca_clean_complete_raw.py
 """
 from __future__ import annotations
 
@@ -36,7 +25,6 @@ from ca_cleaning_utils import (
     load_scaffold,
 )
 
-# Engineering/scaffold are the `raw` view; only the target handling differs.
 WHICH = "raw"
 
 
@@ -52,18 +40,16 @@ def main() -> None:
     df = pd.read_csv(args.input, dtype=str, low_memory=False)
     print(f"[complete_raw] loaded {len(df)} rows, {df.shape[1]} columns from {args.input.name}")
 
-    df = drop_error_rows(df)        # user requirement, before everything
+    df = drop_error_rows(df)
     check_grain_uniqueness(df, "facility_number")
-    df = dollar_strip_df(df)        # TYPE 2 (harmless if no currency)
+    df = dollar_strip_df(df)
     df = engineer_features(df, WHICH)
-    # keep_invalid_target=True is the only difference from clean_raw.py
     out = finalize(df, WHICH, scaffold, keep_invalid_target=True)
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     out.to_csv(args.output, index=False)
     print(f"[complete_raw] wrote {out.shape[0]} rows x {out.shape[1]} cols → {args.output}")
 
-    # Show the full target picture: valid levels, out-of-range, and missing.
     t = out[TARGET_COL]
     n_valid = int(t.isin(VALID_TARGET_VALUES).sum())
     n_invalid_num = int((t.notna() & ~t.isin(VALID_TARGET_VALUES)).sum())

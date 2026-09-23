@@ -1,33 +1,13 @@
 """
-Nebraska Step Up to Quality — finder recon / network-capture helper
-===================================================================
+Nebraska Step Up to Quality — finder recon / network-capture helper.
 
-The only place the STQ *rating* (Step 1-5) is published per provider is the
-parent-facing finder:
+Opens the parent-facing finder in a real browser and logs every network
+request/response while you drive it by hand, plus rendered-DOM snapshots on
+demand, so selectors and URL patterns can be checked against real markup:
 
     https://stepuptoquality.ne.gov/resources-parents-families/provider-search/
 
-This is a WordPress site with a *custom* search plugin. There is no standard
-`provider` post type in wp-json/wp/v2, results are injected via AJAX, and the
-page declares "This site is protected by reCAPTCHA" (Google reCAPTCHA v3,
-invisible). A plain requests.get therefore returns only the empty search shell.
-
-Unlike the WI Blazor capture (where the DOM was the prize), here the prize is
-the **search AJAX response**: when you run a search, the plugin POSTs to some
-endpoint (probably /wp-admin/admin-ajax.php or a custom /wp-json/ route) and
-gets back JSON/HTML containing each matching provider, its identifier, and its
-Step rating. So this script's main job is to **log every network request and
-response** while you drive a real (headful) browser, so we can learn:
-
-  * the search endpoint URL + HTTP method + POST payload (incl. any reCAPTCHA
-    token and WP nonce),
-  * the shape of the returned provider records — in particular which field is
-    the provider identifier (a DHHS license number?) and which is the Step,
-  * whether results can be enumerated in bulk (empty query / wildcard / paging),
-  * the per-provider detail-page URL pattern (if any).
-
-Because reCAPTCHA v3 scores real user gestures, we run **headful** and let you
-perform the search by hand; that yields a valid token and a real response.
+Runs headful by default because the page loads reCAPTCHA v3.
 
 What it writes (to --out-dir, default ne_captures/):
   * network.jsonl  — one JSON object per finished request: method, url,
@@ -48,10 +28,9 @@ Interactive flow:
   2. When results are displayed, come back to the terminal and press Enter to
      snapshot the DOM + flush a note into network.jsonl. (Network is logged
      continuously regardless.)
-  3. Click into one provider's detail view (if the finder has one) and press
-     Enter again to snapshot it — this records the detail URL pattern.
-  4. Type 'q' + Enter to quit. Send me ne_captures/network.jsonl (and a couple
-     of capture_*.html) so I can design the crawler.
+  3. Click into one provider's detail view and press Enter again to snapshot
+     it — this records the detail URL pattern.
+  4. Type 'q' + Enter to quit.
 """
 
 import argparse
@@ -69,8 +48,7 @@ UA = ('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
       'AppleWebKit/537.36 (KHTML, like Gecko) '
       'Chrome/120.0.0.0 Safari/537.36')
 
-# Requests to these hosts/paths are noise (analytics, fonts, recaptcha assets,
-# images). We still log them but flag interesting ones for quick scanning.
+# Every response is logged; bodies are kept only for these.
 INTERESTING_HINTS = ('admin-ajax', '/wp-json/', 'search', 'provider', 'rating',
                      'step', 'api', 'query', '.json')
 
@@ -83,9 +61,7 @@ def is_interesting(url, method):
 
 
 def install_network_logging(context, out_dir, max_body):
-    """Attach a response listener that appends every finished response to
-    network.jsonl, including the request that produced it and (best-effort)
-    the response body."""
+    """Append every finished response (and its request) to network.jsonl."""
     os.makedirs(out_dir, exist_ok=True)
     path = os.path.join(out_dir, 'network.jsonl')
     log = open(path, 'a', encoding='utf-8')
@@ -93,8 +69,6 @@ def install_network_logging(context, out_dir, max_body):
     def on_response(response):
         try:
             req = response.request
-            # Only bother reading bodies for interesting requests to keep the
-            # log small; still record a line for everything else.
             interesting = is_interesting(req.url, req.method)
             body = None
             ctype = ''

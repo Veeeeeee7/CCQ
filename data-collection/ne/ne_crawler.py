@@ -2,63 +2,25 @@
 ne_crawler.py — Nebraska Step Up to Quality provider crawler.
 
 Crawls every `child-care-facility` page on the STQ finder and emits one row per
-provider page.
+provider page, then left-joins the DHHS licensing roster from the seed.
 
     https://stepuptoquality.ne.gov/child-care-facility/{slug}/
 
-Why plain requests and not Playwright
--------------------------------------
-The finder *looks* like it needs a browser — the search page is JS-driven, the
-footer announces "This site is protected by reCAPTCHA", and there is no
-`child-care-facility` post type in wp/v2. All three are red herrings:
+No browser needed: the site's reCAPTCHA only guards the newsletter form, and
+every provider page is a plain WordPress permalink whose content is in the
+initial HTML. The seed enumerates the URLs from the Yoast sitemaps.
 
-  * the reCAPTCHA is loaded by the `gravityformsrecaptcha` plugin and only
-    guards the newsletter form; nothing gates provider pages;
-  * search results are ordinary server-rendered GETs
-    (/provider-search-results/page/N/?address=...&radius=...), and
-  * every provider has a plain WordPress permalink whose full content is in the
-    initial HTML.
+The hero carries the name (h1), the program type (h2) and, only when the
+provider is rated, a `.step-badge` holding the Step (1-5). The body is a grid
+of `.plumb-columns .column` label/value or label/list blocks; fields are
+omitted when a provider has no value. Labels without a dedicated column are
+kept in the `extra_fields` JSON blob so a site change surfaces as data.
 
-So the lightest tool that works is `requests` + BeautifulSoup. We don't even
-touch the search: the seed enumerates every provider URL from the Yoast
-sitemaps, which is both complete and cheap.
-
-Page shape
-----------
-The hero carries the name (h1), the program type (h2) and — only when the
-provider is rated — a `.step-badge` holding the Step (1-5).
-
-The body is a grid of `.plumb-columns .column` blocks. Each is either a
-label/value pair::
-
-    <div class="column"><p><span class="label">License Number</span> CCC8794</p></div>
-
-or a label followed by a list::
-
-    <div class="column">
-      <p><span class="label">Age of Children Served</span></p>
-      <ul class="simple-list tag-list"><li>Infants</li>...</ul>
-    </div>
-
-Accreditations use their own `ul.accredidation-list`, one <li> per body with a
-name span and a `span.date` validity range; we keep those as JSON.
-
-Fields are *omitted* when a provider has no value for them, and unrated
-providers are sparse: e.g. Zackery Daycare (FI10967) has only name, program
-type, license number and contact — no step badge, no capacity, no director.
-Some pages (typically public-school preschools, e.g. Winside Elementary School)
-carry no License Number at all. We still record those rows, with
-`license_number` empty and `has_license_number=0`, and let a later step
-drop them — the crawler's job is a faithful capture, not filtering.
-
-Because the label set is discovered rather than fixed, any label we don't have
-a dedicated column for is preserved in the `extra_fields` JSON blob, so a site
-change surfaces as data rather than as silent loss.
+Some pages (typically public-school preschools) carry no License Number; they
+are still recorded, with `has_license_number=0`.
 
 Grain: one row per facility page (slug). A license number can appear on more
-than one page (duplicate slugs like `waldecker-connie` / `waldecker-connie-2`);
-collapsing to one row per license number happens in cleaning, preferring the
-rated page.
+than one page (e.g. `waldecker-connie` / `waldecker-connie-2`).
 
 Usage:
     python ne_crawler.py --limit 25        # smoke test
@@ -73,14 +35,11 @@ import os
 import random
 import re
 import time
+from datetime import datetime, timezone
 
 import pandas as pd
 import requests
 from bs4 import BeautifulSoup
-
-# ---------------------------------------------------------------------------
-# config
-# ---------------------------------------------------------------------------
 
 BASE_URL = 'https://stepuptoquality.ne.gov'
 SEED_CSV = 'ne_data/ne_seed.csv'
@@ -90,7 +49,6 @@ LOG_FILE = 'ne_crawler_log.txt'
 UA = ('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
       'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
 
-# Selectors, kept together so a theme change is a one-line fix.
 SEL_STEP_BADGE = '.step-badge'
 SEL_COLUMNS = '.plumb-columns .column'
 SEL_ACCRED_LIST = 'ul.accredidation-list'
@@ -99,9 +57,9 @@ SEL_ADDRESS = 'li.icon-address, li.has-icon.icon-address'
 
 REQUEST_TIMEOUT = 45
 RETRIES = 3
-DELAY_RANGE = (0.6, 1.4)        # polite pause between providers
+DELAY_RANGE = (0.6, 1.4)
 
-# Labels we promote to first-class columns. Anything else -> extra_fields.
+# Anything else -> extra_fields.
 LABEL_TO_FIELD = {
     'director': 'director',
     'license number': 'license_number',
@@ -116,10 +74,6 @@ LABEL_TO_FIELD = {
 MULTIVALUE_SEP = '; '
 
 
-# ---------------------------------------------------------------------------
-# logging
-# ---------------------------------------------------------------------------
-
 def create_log_file(path=LOG_FILE):
     if os.path.exists(path):
         os.remove(path)
@@ -132,9 +86,10 @@ def log(message, file=LOG_FILE):
     print(message)
 
 
-# ---------------------------------------------------------------------------
-# transport
-# ---------------------------------------------------------------------------
+def now_utc():
+    """Second-resolution UTC stamp, ISO-8601 with an explicit Z."""
+    return datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+
 
 def fetch(url, session):
     last = None
@@ -150,10 +105,6 @@ def fetch(url, session):
             time.sleep(1.5 * (attempt + 1))
     raise last
 
-
-# ---------------------------------------------------------------------------
-# small parsing helpers
-# ---------------------------------------------------------------------------
 
 def _clean(s):
     if s is None:
@@ -219,10 +170,7 @@ def _accreditations(column):
     return out
 
 
-# ---------------------------------------------------------------------------
-# sections — each returns a dict; each has an empty_*() twin so a failure in
-# one section never kills the row.
-# ---------------------------------------------------------------------------
+# Each section has an empty_*() twin so a failure in one never kills the row.
 
 def empty_header():
     return {'facility_name': None, 'program_type': None, 'step_rating': None}
@@ -270,7 +218,6 @@ def crawl_program(soup):
         elif field:
             out[field] = _value_of(column)
         else:
-            # Unknown label: keep it rather than lose it.
             items = _list_items(column)
             extra[label] = MULTIVALUE_SEP.join(items) if items else _value_of(column)
 
@@ -314,7 +261,9 @@ def crawl_contact(soup):
 
 
 def empty_meta():
-    return {'facility_id': None}
+    # fetched_at is filled in by crawl_one(); it lives here because
+    # all_columns() builds the CSV header from the empty_* constructors.
+    return {'facility_id': None, 'fetched_at': None}
 
 
 _FACILITY_ID = re.compile(r'[?&]facility=(\d+)')
@@ -339,10 +288,6 @@ def crawl_meta(soup):
     return out
 
 
-# ---------------------------------------------------------------------------
-# rectangular output + resume
-# ---------------------------------------------------------------------------
-
 def all_columns():
     cols = ['slug', 'facility_url']
     for fn in (empty_header, empty_program, empty_contact, empty_meta):
@@ -365,6 +310,29 @@ def append_row(row, output_csv):
     exists = os.path.exists(output_csv) and os.path.getsize(output_csv) > 0
     pd.DataFrame([full], columns=cols).to_csv(
         output_csv, mode='a', header=not exists, index=False)
+
+
+def assert_output_schema(output_csv):
+    """An existing output file must have exactly the current header.
+
+    append_row() writes the header only when the file is empty, so resuming
+    into a file with a different schema would silently shift fields.
+    """
+    if not os.path.exists(output_csv) or os.path.getsize(output_csv) == 0:
+        return
+    with open(output_csv, encoding='utf-8') as fh:
+        header = (fh.readline().rstrip('\r\n')).split(',')
+    expected = all_columns()
+    if header != expected:
+        missing = [c for c in expected if c not in header]
+        extra = [c for c in header if c not in expected]
+        raise SystemExit(
+            f'{output_csv} was written with a different schema '
+            f'({len(header)} columns vs {len(expected)}). Resuming would write '
+            f'rows that do not line up with its header. '
+            + (f'Columns this run would add: {missing}. ' if missing else '')
+            + (f'Columns it no longer writes: {extra}. ' if extra else '')
+            + 'Move the file aside and start a fresh full run.')
 
 
 def load_completed(output_csv):
@@ -391,15 +359,10 @@ def load_seed(seed_csv):
     return df
 
 
-# ---------------------------------------------------------------------------
-# driver
-# ---------------------------------------------------------------------------
-
 def crawl_one(url, session):
-    """Fetch + parse one provider page. Each section is independently guarded:
-    a broken field records its section name in `errors` and leaves the rest of
-    the row intact."""
+    """Fetch + parse one provider page; a failed section is named in `errors`."""
     html = fetch(url, session)
+    fetched_at = now_utc()
     if html is None:
         return None, 'http_404'
 
@@ -415,11 +378,17 @@ def crawl_one(url, session):
             row.update(empty())
             errors.append(name)
             log(f'    section "{name}" failed: {e}')
+    # After the loop: a failing meta section resets the meta keys.
+    row['fetched_at'] = fetched_at
     row['has_license_number'] = 1 if row.get('license_number') else 0
     return row, (';'.join(errors) or None)
 
 
 def crawler(seed_csv=SEED_CSV, output_csv=OUT_CSV, limit=None, resume=True):
+    assert_output_schema(output_csv)
+    started = now_utc()
+    log(f'=== crawl started {started} | seed={seed_csv} out={output_csv} '
+        f'limit={limit} resume={resume}')
     seed = load_seed(seed_csv)
     done = load_completed(output_csv) if resume else set()
     todo = seed[~seed['slug'].isin(done)] if done else seed
@@ -466,29 +435,23 @@ def crawler(seed_csv=SEED_CSV, output_csv=OUT_CSV, limit=None, resume=True):
 
     log(f'\nDone. rated={rated} unrated={unrated} '
         f'no_license_number={no_license} failed={failed} -> {output_csv}')
+    log(f'=== crawl finished {now_utc()} (started {started})')
 
 
 
 def attach_licensing(seed_csv=SEED_CSV, output_csv=OUT_CSV):
-    """Fold the DHHS licensing roster into the crawled rows, one pass, in place.
+    """Left-join the DHHS licensing roster (the seed's `dhhs_roster` half) onto
+    the crawled rows, in place.
 
-    The finder pages carry the rating but almost nothing about the licence
-    itself; the roster carries capacity, age range, opening hours and the issue
-    date but no rating. Both halves live in the seed, tagged by `seed_source`,
-    so the join needs no extra file.
-
-    LEFT, not inner: the finder is the source of truth for which providers
-    exist, and a licence number that is not on the current monthly roster --
-    a new or recently-closed site -- must keep its rating and simply carry
-    empty licensing columns.
+    LEFT, not inner: a licence missing from the monthly roster (a new or
+    recently-closed site) keeps its rating with empty licensing columns.
     """
     seed = pd.read_csv(seed_csv, dtype=str, keep_default_na=False, low_memory=False)
     roster = seed[seed['seed_source'] == 'dhhs_roster'].drop(columns=['seed_source'])
     roster = roster.loc[:, [c for c in roster.columns
                             if roster[c].astype(str).str.strip().ne('').any()]]
 
-    # One row per licence. The roster occasionally repeats a number across
-    # monthly snapshots; the first occurrence is the current one.
+    # The roster occasionally repeats a number; the first occurrence is current.
     roster['License_Number'] = (roster['License_Number'].astype(str).str.strip()
                                 .str.replace(r'\.0$', '', regex=True).str.upper())
     roster = roster.drop_duplicates(subset='License_Number', keep='first')
@@ -506,8 +469,8 @@ def attach_licensing(seed_csv=SEED_CSV, output_csv=OUT_CSV):
 
     merged.to_csv(output_csv, index=False)
     matched = int(merged['dhhs_license_type'].notna().sum())
-    log(f'licensing join: {matched}/{len(merged)} rows matched the roster; '
-        f'{records.shape[1]} -> {merged.shape[1]} columns')
+    log(f'licensing join {now_utc()}: {matched}/{len(merged)} rows matched '
+        f'the roster; {records.shape[1]} -> {merged.shape[1]} columns')
 
 
 def _slug(text):
@@ -529,6 +492,11 @@ if __name__ == '__main__':
                          'existing records CSV. Run once after a full crawl.')
     args = ap.parse_args()
 
+    if args.fresh_log and args.join_only:
+        raise SystemExit(
+            '--fresh-log with --join-only truncates the log and then writes '
+            'only the join summary, losing the crawl lines. Drop one of the '
+            'two flags.')
     if args.fresh_log:
         create_log_file()
     if args.join_only:

@@ -1,18 +1,17 @@
 """
-co_clean_full.py — Build the `full` dataset (strictly numeric/boolean +
-provider_id) for classical/tabular ML from the Colorado Shines scrape.
+co_clean_full.py — Build the `full` dataset (numeric/boolean + provider_id,
+valid ratings only) from the Colorado Shines records.
 
 Pipeline:
-  load (as strings) -> null out site-scraped fields on id_mismatch (row kept;
-  see co_cleaning_utils docstring) -> dollar-strip (no-op today, kept for
-  cross-state parity) -> grain check -> drop NON_FEATURE_COLS -> per-field
-  builders (numeric/boolean only) -> finalize (valid ratings only).
+  load (as strings) -> null out page-derived fields on id_mismatch (row kept)
+  -> dollar-strip (no-op today) -> grain check -> drop NON_FEATURE_COLS ->
+  per-field builders (numeric/boolean only) -> finalize (valid ratings only).
 
-Same early steps and same row filtering as co_clean_raw.py (so the two
-outputs are row-aligned and a single fold file applies to both).
+Same early steps and row filtering as co_clean_raw.py, so the two outputs are
+row-aligned.
 
 Run:
-    python co_clean_full.py --input co_data/co_records.csv --output co_data/co_cleaned_full.csv
+    python co_clean_full.py
 """
 from __future__ import annotations
 
@@ -40,14 +39,13 @@ def main() -> None:
     print(f"[full] loading {args.input}")
     df = pd.read_csv(args.input, low_memory=False, dtype=str)  # preserve leading zeros
 
-    # --- shared early steps (identical to raw, keeps both row-aligned) -------
     df = U.null_out_enrichment_on_mismatch(df, log)
     df = df.drop(columns=["errors"], errors="ignore")
     df = U.strip_dollars(df)
     U.check_grain_unique(df, U.ID_COL, log)
     df = df.drop(columns=[c for c in U.NON_FEATURE_COLS if c in df.columns], errors="ignore")
 
-    # --- base: id, target, numeric passthroughs -------------------------------
+    # base: id, target, numeric passthroughs
     base = pd.DataFrame(index=df.index)
     base[U.ID_COL] = df[U.ID_COL]
     base[U.TARGET_COL] = df[U.TARGET_COL]
@@ -74,7 +72,6 @@ def main() -> None:
         if c in df.columns:
             base[c] = U.to_boolean(df[c], ("true",), ("false",))
 
-    # --- per-field builders (numeric / boolean only) --------------------------
     parts = [base, U.derive_date_features(df, log)]
     if "hours_of_operation" in df.columns:
         parts.append(U.derive_operating_hours(df["hours_of_operation"], log))
@@ -87,9 +84,10 @@ def main() -> None:
     if "special_needs" in df.columns:
         parts.append(U.build_multivalue(df["special_needs"], ";", "need", "full"))
     if "languages_spoken" in df.columns:
-        parts.append(U.build_keyterm(df["languages_spoken"], U.LANGUAGE_KEYTERMS,
-                                     "language", "full", log))
-    parts.append(U.build_licensing_history(df, "full"))
+        # one column per recognised language; the k>=5 sweep folds rare ones
+        # into language_other
+        parts.append(U.build_language_features(df["languages_spoken"], "full", log))
+    parts.append(U.build_licensing_history(df, "full", log))
 
     engineered = pd.concat(parts, axis=1)
 

@@ -1,27 +1,12 @@
-"""Per-state feature attribution via SHAP over an XGBoost regressor.
+"""Per-state TreeSHAP attribution over an XGBoost regressor, with a noise floor
+from shuffled shadow columns.
 
-An interpretation layer over the within-state experiment: it writes no rows into
-the within-state result CSVs and adds no method tag.
+A regressor (not the K-way classifier) gives one SHAP matrix in rating points
+instead of one per class. Feature direction is `dir_corr`, not `mean_shap`.
+`--grid-only` rebuilds the 3x4 figure from existing per-state CSVs.
 
-Fits `XGBRegressor(reg:squarederror)` on the ordinal rating rather than the K-way
-classifier, so SHAP returns one (n, d) matrix in rating points instead of one
-table per class. Hyperparameters mirror `baselines_ml.make_xgb`; only `objective`
-differs. `--qwk-check` reports the regressor's CV QWK against the classifier's.
-
-A Boruta-style noise floor is computed alongside: `--n-shadow` real columns are
-permuted and re-fit, and the floor is the largest mean |SHAP| any shadow attains.
-Shadow sources are drawn across cardinality tiers, so the floor is calibrated for
-continuous columns and is strict for binary ones. Above the floor is signal;
-below it is not evidence of noise.
-
-Use `dir_corr`, not `mean_shap`, for direction.
-
-    python shap_xgb.py \\
-        --input data/nc_records_cleaned_full.csv \\
-        --output results/<date>/shap_xgb/shap_xgb_nc_results.csv \\
-        --folds fold_indices/nc_native_folds.json \\
-        --remap-state NC --rating-scale 5star
-    python shap_xgb.py --grid-only --output results/<date>/shap_xgb/grid.csv
+    python shap_xgb.py --input data/nc_records_cleaned_full.csv \\
+        --folds fold_indices/nc_native_folds.json --remap-state NC --rating-scale 5star
 """
 from __future__ import annotations
 
@@ -46,21 +31,18 @@ from utils import (
     get_folds,
     load_data,
     maybe_remap,
+    resolve_output,
+    setup_logging,
 )
 
 SHADOW_PREFIX = "shadow__"
 
-# The 12 states, in the order the drivers use them, for the grid figure.
+# Panel order of the grid figure.
 GRID_STATES = ["ca", "ga", "nc", "wi", "co", "ky", "md", "mt", "ne", "ok", "sc", "wa"]
 
 
 def n_jobs_from_env(default: int = 4) -> int:
-    """Respect the SLURM allocation instead of grabbing every visible core.
-
-    `baselines_ml` uses n_jobs=-1, which is correct on a whole-node GPU job but
-    antisocial on the shared CPU partition this experiment runs on
-    (--cpus-per-task=4). Falls back to `default` off-cluster.
-    """
+    """CPU count from SLURM_CPUS_PER_TASK / SLURM_CPUS_ON_NODE if set, else `default`."""
     for var in ("SLURM_CPUS_PER_TASK", "SLURM_CPUS_ON_NODE"):
         val = os.environ.get(var)
         if val and val.isdigit() and int(val) > 0:
@@ -69,11 +51,7 @@ def n_jobs_from_env(default: int = 4) -> int:
 
 
 def make_xgb_regressor(n_jobs: int):
-    """XGBoost regressor for the attribution model.
-
-    Identical to `baselines_ml.make_xgb` except for `objective`, so the model
-    explained here is the model the tables report.
-    """
+    """`baselines_ml.make_xgb` with a squared-error objective instead of softprob."""
     from xgboost import XGBRegressor
     return XGBRegressor(
         n_estimators=500,
@@ -92,15 +70,10 @@ def make_xgb_regressor(n_jobs: int):
 def build_shadow_frame(
     df: pd.DataFrame, feature_cols: list[str], n_shadow: int, rng: np.random.Generator
 ) -> tuple[pd.DataFrame, list[str]]:
-    """Add permuted shadow copies of real columns, as a noise floor.
+    """Return (shadow frame, source columns): permuted copies of real columns for the noise floor.
 
-    Sources are drawn across cardinality tiers rather than uniformly by rank:
-    most columns here are binary, and since the floor is a max over shadows and
-    high-cardinality columns win it, rank-uniform sampling would reduce the floor
-    to a sample of size one.
-
-    A column with k distinct values offers k-1 split candidates, so the max over
-    more draws is larger by chance alone; the tiers keep that comparable.
+    Sources are spread across cardinality tiers: the floor is a max, high-cardinality
+    columns dominate it, and most columns are binary, so uniform sampling is unstable.
     """
     if n_shadow <= 0:
         return pd.DataFrame(index=df.index), []
@@ -121,7 +94,6 @@ def build_shadow_frame(
     tiers = {k: v for k, v in tiers.items() if v}
 
     def _spread(cols, k, key):
-        """k columns spread evenly across `cols` sorted by `key`."""
         if k <= 0 or not cols:
             return []
         s = key[cols].sort_values().index.tolist()
@@ -138,8 +110,7 @@ def build_shadow_frame(
     for name, cols in tiers.items():
         key = prevalence if name == "binary" else card
         chosen += _spread(cols, per_tier, key)
-    # Top up from the highest tier if integer division left us short: the floor
-    # is a max, so extra draws at the high end are what stabilise it.
+    # Top up from the highest tier, where extra draws stabilise the max.
     if len(chosen) < n_shadow:
         top = tiers[list(tiers)[-1]]
         for c in _spread(top, n_shadow, card):
@@ -149,7 +120,7 @@ def build_shadow_frame(
     data = {}
     for col in chosen:
         vals = df[col].to_numpy(copy=True)
-        rng.shuffle(vals)  # destroys the label relationship, keeps the marginal
+        rng.shuffle(vals)
         data[f"{SHADOW_PREFIX}{col}"] = vals
 
     counts = {n: sum(1 for c in chosen if c in cols) for n, cols in tiers.items()}
@@ -165,10 +136,7 @@ def round_to_scale(pred: np.ndarray, classes_sorted) -> np.ndarray:
 
 
 def fit_and_explain(X, y_float, sample_weight, feature_names, n_jobs):
-    """Fit the regressor on all rows and compute TreeSHAP values.
-
-    Returns the per-row SHAP matrix in rating points alongside the fitted model.
-    """
+    """Fit on all rows and return (shap matrix (n, d), model, base value)."""
     import shap
 
     model = make_xgb_regressor(n_jobs)
@@ -182,8 +150,7 @@ def fit_and_explain(X, y_float, sample_weight, feature_names, n_jobs):
     sv = np.asarray(sv)
     print(f"[shap] explained {sv.shape} in {time.time() - t0:.1f}s")
 
-    # Single-output regression MUST give (n, d). Older shap returns a list;
-    # assert the shape rather than branching on a version string.
+    # Some shap versions return a list; assert the shape instead of branching.
     if sv.ndim != 2 or sv.shape != X.shape:
         raise RuntimeError(
             f"Expected SHAP values of shape {X.shape} for a single-output "
@@ -194,9 +161,7 @@ def fit_and_explain(X, y_float, sample_weight, feature_names, n_jobs):
             f"Feature-name count {len(feature_names)} != SHAP width "
             f"{sv.shape[1]}; the preprocessor changed the column set.")
 
-    # ADDITIVITY: sum of attributions + base value must reconstruct the model's
-    # own prediction exactly. This one identity catches essentially every
-    # preprocessing or column-ordering bug, because any misalignment breaks it.
+    # Additivity (sum(shap) + base == predict) catches any column misalignment.
     expected = float(np.ravel(explainer.expected_value)[0])
     recon = sv.sum(axis=1) + expected
     max_err = float(np.abs(recon - model.predict(X)).max())
@@ -210,13 +175,9 @@ def fit_and_explain(X, y_float, sample_weight, feature_names, n_jobs):
 
 
 def feature_direction(sv, X) -> np.ndarray:
-    """Per-feature Pearson correlation between feature value and its SHAP value.
+    """Per-feature Pearson correlation between feature value and SHAP value.
 
-    This is the direction statistic, not `mean_shap`. Balanced sample weighting
-    offsets `base_score` from the unweighted row mean, which lands in every
-    feature's signed value; and a feature with a non-monotone effect can have a
-    signed mean near zero while still mattering. The correlation is unaffected by
-    both.
+    Used for direction instead of mean SHAP, which balanced weighting offsets via base_score.
     """
     xc = X - X.mean(axis=0)
     sc = sv - sv.mean(axis=0)
@@ -234,13 +195,10 @@ def summarize(sv, X, feature_names, shadow_names, card=None) -> pd.DataFrame:
     out = pd.DataFrame({
         "feature": feature_names,
         "mean_abs_shap": mean_abs,
-        # THE direction column. `mean_shap` is retained for completeness but is
-        # baseline-offset-confounded — see feature_direction().
+        # Direction column; mean_shap is offset by the balanced weighting.
         "dir_corr": feature_direction(sv, X),
         "mean_shap": mean_signed,
     })
-    # Cardinality + tier travel with the row so a bucketed re-analysis of the
-    # floor is possible from the CSV alone, without another fit.
     if card is not None:
         src = out["feature"].str.replace(f"^{SHADOW_PREFIX}", "", regex=True)
         out["cardinality"] = src.map(card)
@@ -253,7 +211,7 @@ def summarize(sv, X, feature_names, shadow_names, card=None) -> pd.DataFrame:
     total = real["mean_abs_shap"].sum()
     out["shap_share"] = out["mean_abs_shap"] / total if total > 0 else np.nan
 
-    # Rank REAL features only; shadows are diagnostics, not findings.
+    # Rank real features only.
     out["rank"] = np.nan
     order = real.sort_values("mean_abs_shap", ascending=False).index
     out.loc[order, "rank"] = np.arange(1, len(order) + 1)
@@ -268,11 +226,7 @@ def summarize(sv, X, feature_names, shadow_names, card=None) -> pd.DataFrame:
 
 
 def run_qwk_check(df, feature_cols, folds, classes_sorted, n_jobs, balanced: bool):
-    """5-fold CV QWK for the regressor, rounded to the rating scale.
-
-    Optionally reports the delta against the classifier rows in
-    `compare_results`.
-    """
+    """Mean CV metrics for the regressor with predictions rounded to the rating scale."""
     fold_metrics = []
     for fold in folds:
         tr, va = fold["train_idx"], fold["val_idx"]
@@ -306,9 +260,7 @@ def lookup_classifier_qwk(path: "Path | None") -> float:
     return float(row["qwk"].iloc[0]) if len(row) else float("nan")
 
 
-# -----------------------------------------------------------------------------
-# Figures
-# -----------------------------------------------------------------------------
+# ---- Figures ----
 def plot_state(summary, sv, X, feature_names, state, top_k, figs_dir):
     import matplotlib
     matplotlib.use("Agg")
@@ -320,9 +272,7 @@ def plot_state(summary, sv, X, feature_names, state, top_k, figs_dir):
     floor = summary["noise_floor"].iloc[0]
 
     fig, ax = plt.subplots(figsize=(7, 0.38 * len(top) + 1.2))
-    # Colour from dir_corr, NOT mean_shap: mean_shap carries the balanced-
-    # weighting baseline offset, which made whole states one colour (see
-    # feature_direction()).
+    # Colour by dir_corr; mean_shap carries the weighting offset.
     colors = ["#1D9E75" if v >= 0 else "#D85A30" for v in top["dir_corr"]]
     ax.barh(top["feature"], top["mean_abs_shap"], color=colors)
     if np.isfinite(floor):
@@ -355,12 +305,7 @@ def plot_state(summary, sv, X, feature_names, state, top_k, figs_dir):
 
 
 def _shorten(name: str, maxlen: int = 26) -> str:
-    """Middle-elide a feature name so it fits a narrow paper panel.
-
-    Keeps the head AND the tail because the tail is often the discriminating
-    part (`accreditation_national_association_for_family_child_care_nafcc` ->
-    `accreditation_natio…ce_nafcc`); a plain truncation would drop it.
-    """
+    """Middle-elide a feature name, keeping the often-discriminating tail."""
     name = str(name)
     if len(name) <= maxlen:
         return name
@@ -369,12 +314,7 @@ def _shorten(name: str, maxlen: int = 26) -> str:
 
 
 def plot_grid(results_dir: Path, top_k: int = 10, paper: bool = True):
-    """3x4 grid of per-state top-k panels, built from the per-state CSVs.
-
-    Run after every state has finished, since each run knows only its own
-    state. ``paper=True`` sizes the figure at 1:1 for a two-column page and
-    elides long feature names.
-    """
+    """3x4 grid of per-state top-k panels; `paper` sizes it for a two-column page."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -382,8 +322,6 @@ def plot_grid(results_dir: Path, top_k: int = 10, paper: bool = True):
     if paper:
         figsize, fs_lab, fs_tick, fs_title, fs_sup, maxlen = \
             (7.16, 6.6), 4.6, 4.4, 6.5, None, 26
-        # No suptitle in paper mode: the LaTeX caption carries it, and dropping
-        # it buys the top row ~0.3 in.
         margins = dict(left=0.165, right=0.985, top=0.975, bottom=0.045,
                        wspace=1.05, hspace=0.30)
     else:
@@ -398,11 +336,7 @@ def plot_grid(results_dir: Path, top_k: int = 10, paper: bool = True):
     for ax, st in zip(axes.ravel(), GRID_STATES):
         path = results_dir / f"shap_xgb_{st}_results.csv"
         if not path.exists():
-            # Blank the panel but KEEP the axes in the layout. ax.axis("off")
-            # drops it from tight_layout's grid, so the panels that DO have
-            # data stretch to fill the gap and the figure stops being a
-            # comparable 3x4 — states finish at different times, so a partial
-            # grid is the normal case, not the exception.
+            # Blank but keep the axes so the grid geometry stays fixed.
             ax.set_title(f"{st.upper()} — missing", fontsize=fs_title, color="#888780")
             ax.set_xticks([])
             ax.set_yticks([])
@@ -422,8 +356,7 @@ def plot_grid(results_dir: Path, top_k: int = 10, paper: bool = True):
         ax.tick_params(axis="y", labelsize=fs_lab, pad=1, length=0)
         ax.tick_params(axis="x", labelsize=fs_tick, pad=1, length=2)
         if paper:
-            # A 4-column grid leaves ~1 in per panel for the x axis; the default
-            # tick locator puts 6-7 labels there and they collide.
+            # Default locator crowds the narrow panels.
             from matplotlib.ticker import MaxNLocator
             ax.xaxis.set_major_locator(MaxNLocator(nbins=4, prune=None))
             for side in ("top", "right"):
@@ -434,10 +367,7 @@ def plot_grid(results_dir: Path, top_k: int = 10, paper: bool = True):
     if fs_sup is not None:
         fig.suptitle(f"Top-{top_k} features by mean |SHAP| (XGBoost regression), "
                      "dashed line = shadow-feature noise floor", fontsize=fs_sup)
-    # FIXED geometry, not tight_layout: tight_layout sizes panels from their
-    # content, so empty panels (states not finished yet) collapse and the ones
-    # with data stretch to fill the gap — the grid stops being comparable.
-    # subplots_adjust keeps every panel the same size regardless.
+    # Fixed geometry: tight_layout would resize panels around missing states.
     fig.subplots_adjust(**margins)
     figs = results_dir / "figs"
     figs.mkdir(parents=True, exist_ok=True)
@@ -447,36 +377,34 @@ def plot_grid(results_dir: Path, top_k: int = 10, paper: bool = True):
     print(f"Grid figure written for {n_found}/{len(GRID_STATES)} states -> {figs}")
 
 
-# -----------------------------------------------------------------------------
-# Main
-# -----------------------------------------------------------------------------
+# ---- Main ----
 def main() -> None:
     parser = argparse.ArgumentParser()
     add_io_args(parser)
     parser.add_argument("--top-k", type=int, default=10,
-                        help="How many features the top-K report covers (default 10).")
+                        help="Number of top features to report and plot.")
     parser.add_argument("--n-shadow", type=int, default=10,
                         help="Shadow (shuffled-copy) columns for the noise floor. "
                              "0 disables the floor.")
     parser.add_argument("--figs-dir", type=Path, default=None,
-                        help="Where figures go (default: a 'figs' subdir next to --output).")
+                        help="Figure directory (default: 'figs' next to --output).")
     parser.add_argument("--no-figs", action="store_true", help="Skip figure generation.")
     parser.add_argument("--unweighted", action="store_true",
-                        help="Fit WITHOUT balanced sample weights. The suite's "
-                             "classical baselines are class-weighted, so weighted "
-                             "is the default here too.")
+                        help="Fit without balanced sample weights.")
     parser.add_argument("--qwk-check", action="store_true", default=True,
-                        help="5-fold CV QWK for the regressor, to show it is a fair "
-                             "stand-in for the reported classifier (default on).")
+                        help="Report the regressor's CV QWK (default on).")
     parser.add_argument("--no-qwk-check", dest="qwk_check", action="store_false")
     parser.add_argument("--compare-results", type=Path, default=None,
-                        help="Within-state results CSV for this state; the `xgb` "
-                             "mean QWK is read from it for the delta.")
+                        help="Within-state results CSV whose `xgb` mean QWK the "
+                             "regressor is compared against.")
     parser.add_argument("--grid-only", action="store_true",
-                        help="Skip fitting; rebuild the 3x4 grid figure from the "
-                             "per-state CSVs already in --output's directory.")
+                        help="Only rebuild the grid figure from the per-state CSVs "
+                             "in --output's directory.")
     args = parser.parse_args()
     configure_verbosity(args.verbose)
+    _st = (args.remap_state or "all").lower()
+    args.output = resolve_output(args, "shap_xgb", f"shap_xgb_{_st}_results.csv")
+    setup_logging(args, "shap_xgb", f"shap_xgb_{_st}")
 
     out_dir = Path(args.output).parent
     if args.grid_only:
@@ -489,26 +417,22 @@ def main() -> None:
                      scale=args.rating_scale)
 
     feature_cols = get_feature_columns(df)
-    # int, not the float the CSV parses to: these become clip bounds in
-    # round_to_scale and the label space for compute_metrics, and ratings are
-    # integers by definition.
+    # int, not the CSV's float: used as clip bounds and as the metric label space.
     classes_sorted = sorted(int(c) for c in df[TARGET_COL].unique())
     n_jobs = n_jobs_from_env()
     print(f"[{state}] {len(df)} rows, {len(feature_cols)} features, "
           f"classes={classes_sorted}, n_jobs={n_jobs}")
 
-    # --- shadow features -----------------------------------------------------
+    # ---- Shadow features ----
     rng = np.random.default_rng(SEED)
     shadow_df, shadow_sources = build_shadow_frame(df, feature_cols, args.n_shadow, rng)
     shadow_names = list(shadow_df.columns)
     aug = pd.concat([df[feature_cols], shadow_df], axis=1)
     all_cols = feature_cols + shadow_names
-    # Cardinality of the REAL columns, keyed by source name. Shadows inherit
-    # their source's value via the name strip in summarize(), so one map covers
-    # both and the CSV can carry a per-feature tier for later re-analysis.
+    # Shadows inherit their source's cardinality via the name strip in summarize().
     card_all = df[feature_cols].nunique(dropna=True)
 
-    # --- fit + explain -------------------------------------------------------
+    # ---- Fit + explain ----
     pre = build_preprocessor(numerical_cols=all_cols, categorical_cols=[],
                              scale=False, encoding="ordinal")
     X = pre.fit_transform(aug)
@@ -520,7 +444,7 @@ def main() -> None:
     sv, model, expected = fit_and_explain(X, y_float, sample_weight, feature_names, n_jobs)
     summary = summarize(sv, X, feature_names, shadow_names, card=card_all)
 
-    # --- standing assertions -------------------------------------------------
+    # ---- Checks ----
     top = summary[~summary["is_shadow"]].head(args.top_k)
     leaky_hits = [f for f in top["feature"] if f in LEAKY_COLS]
     if leaky_hits:
@@ -539,19 +463,13 @@ def main() -> None:
               f"|shap|={r['mean_abs_shap']:.4f}  dir={r['dir_corr']:+.2f}"
               f"  [{r.get('card_tier', '?')}]{flag}")
 
-    # A shadow column outranking real features means the model is largely
-    # fitting noise, which on a small state is a plausible outcome worth
-    # surfacing. The floor is the largest shadow, so this counts real features
-    # only.
     n_real_above = int((summary["mean_abs_shap"] > floor).sum()) if np.isfinite(floor) else -1
     if np.isfinite(floor) and n_real_above < args.top_k:
         print(f"  WARNING: only {n_real_above} real features beat a shuffled "
               f"column — this state's model is mostly fitting noise.")
 
-    # --- write ---------------------------------------------------------------
-    # NB keep the current run's frame separate from what lands on disk: results
-    # logging APPENDS (never dedupes), so the on-disk frame may carry rows from
-    # earlier runs and must not be what the figures are drawn from.
+    # ---- Write ----
+    # The CSV appends, so figures are drawn from this run's frame, not the file.
     summary.insert(0, "state", state)
     summary.insert(1, "scale", args.rating_scale)
     summary.insert(2, "n_rows", len(df))
@@ -567,7 +485,7 @@ def main() -> None:
     to_write.to_csv(out_path, index=False)
     print(f"Wrote {out_path}")
 
-    # --- the regressor-vs-classifier gate ------------------------------------
+    # ---- Regressor vs classifier QWK ----
     if args.qwk_check:
         print(f"\n[{state}] QWK check (regressor, 5-fold CV on the native folds)")
         folds = get_folds(df, folds_path=args.folds)

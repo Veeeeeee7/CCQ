@@ -10,15 +10,19 @@ HERE = Path(__file__).resolve().parent
 DEFAULT_INPUT = HERE / "ne_data" / "ne_records.csv"
 DEFAULT_OUTPUT = HERE / "ne_data" / "ne_records_anonymized.csv"
 LOG_FILE = HERE / "ne_privacy_log.txt"
-MAP_PATH = HERE.parent / "private" / "provider_id_map_ne.csv"
+MAP_PATH = HERE.parent / "data-private" / "provider_id_map_ne.csv"
 
 GRAIN_COL = "provider_key"
 STATE_CODE = "ne"
 
-PROTECTED_COLS = ("facility_id", "license_number", "step_rating")
+# step_rating is the target and must survive whatever else is dropped.
+PROTECTED_COLS = ("step_rating",)
 
 NONNULL_HELPER = "_source_nonnull_dropped"
 
+# Direct identifiers: the Step Up finder page fields, the DHHS roster columns,
+# and slug/facility_id/license_number, which resolve to the provider's public
+# finder page or licence record.
 PRIVATE_COLS = [
     "facility_name",
     "director",
@@ -26,6 +30,17 @@ PRIVATE_COLS = [
     "address_raw",
     "street",
     "facility_url",
+    "slug",
+    "license_number",
+    "facility_id",
+    "dhhs_objectid",
+    "dhhs_full_name",
+    "dhhs_owner_manager",
+    "dhhs_license_number",
+    "dhhs_address",
+    "dhhs_address_2",
+    "dhhs_phone",
+    "dhhs_zip4",
 ]
 
 LEAKAGE_COLS: list[str] = [
@@ -57,7 +72,26 @@ def build_provider_key(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def surrogate_ids(df: pd.DataFrame, state: str, seed=None) -> pd.DataFrame:
+def guard_id_map(remint: bool) -> None:
+    """Refuse to re-mint an existing surrogate map unless asked explicitly."""
+    if MAP_PATH.exists() and not remint:
+        raise SystemExit(
+            f"refusing to overwrite {MAP_PATH}: re-minting draws a fresh "
+            f"permutation, so every provider_id already published in "
+            f"ne_data/ne_records_cleaned_*.csv would silently point at a "
+            f"different provider. Pass --remint to do it deliberately."
+        )
+
+
+def surrogate_ids(df: pd.DataFrame, state: str, seed=None,
+                  remint: bool = False) -> pd.DataFrame:
+    """Replace the grain value with a surrogate and write the map.
+
+    The labels are a fresh `rng.permutation`, so a second run pairs the same
+    set of surrogates with different providers. The map and
+    ne_records_anonymized.csv must be written together or not at all.
+    """
+    guard_id_map(remint)
     values = df[GRAIN_COL].astype(str)
     distinct = list(dict.fromkeys(values))
     rng = np.random.default_rng(seed)
@@ -93,13 +127,34 @@ def main() -> None:
     ap.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     ap.add_argument("--dry-run", action="store_true",
                     help="report the drop list and exit without writing")
+    ap.add_argument("--remint", action="store_true",
+                    help="allow the run to overwrite an existing "
+                         "data-private/provider_id_map_ne.csv; without it an "
+                         "existing map is a hard error")
     args = ap.parse_args()
 
     df = pd.read_csv(args.input, low_memory=False, dtype=str,
                      keep_default_na=False)
     before = df.shape
 
-    doomed = [c for c, _ in drop_targets(df.columns)]
+    targets = drop_targets(df.columns)
+    doomed = [c for c, _ in targets]
+    missing = [c for c in PRIVATE_COLS + LEAKAGE_COLS if c not in df.columns]
+
+    # The dry run returns before surrogate_ids() rewrites the id map, and
+    # prints rather than appending to ne_privacy_log.txt.
+    if args.dry_run:
+        for col, cls in targets:
+            print(f"[{cls}] dropping {col}")
+        if missing:
+            print(f"[note] {len(missing)} listed column(s) absent from this "
+                  f"input: {missing}")
+        print(f"\ndry run: would drop {len(targets)} of {before[1]} columns")
+        return
+
+    # Fail before the first log line rather than half way through.
+    guard_id_map(args.remint)
+
     populated = sum((df[c].notna() & (df[c].astype(str) != "")).astype(int)
                     for c in doomed)
     df = df.copy()
@@ -108,19 +163,13 @@ def main() -> None:
         f"column(s) so the populated-field count stays recoverable")
 
     df = build_provider_key(df)
-    df = surrogate_ids(df, STATE_CODE)
+    df = surrogate_ids(df, STATE_CODE, remint=args.remint)
 
-    targets = drop_targets(df.columns)
     for col, cls in targets:
         log(f"[{cls}] dropping {col}")
-    missing = [c for c in PRIVATE_COLS + LEAKAGE_COLS if c not in df.columns]
     if missing:
         log(f"[note] {len(missing)} listed column(s) absent from this input: "
             f"{missing}")
-
-    if args.dry_run:
-        print(f"\ndry run: would drop {len(targets)} of {before[1]} columns")
-        return
 
     out = df.drop(columns=[c for c, _ in targets], errors="ignore")
 

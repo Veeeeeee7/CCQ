@@ -1,35 +1,28 @@
-"""Qwen3-4B with a trained classification head, for cross-state transfer.
-
-Three variants sharing one protocol -- pretrain on the pool, then finetune --
-differing only in adaptation capacity and input construction:
+"""Qwen3-4B with a trained classification head, for cross-state and within-state runs.
 
   --adapt head            xfer_qwen_cls_*        frozen backbone, K-way head only
   --adapt head --rag      xfer_qwen_cls_rag_*    same, inputs prefixed with
                                                  per-class medoid exemplars
   --adapt lora            xfer_qwen_cls_lora_*   LoRA adapters plus head
 
-All three are discriminatively trained classifiers: the input is the serialized
-row, the output is the head's K-way softmax. There is no chat template, rubric,
-generation step or verbalizer.
-
-A stratified 20% slice of the target is carved once and scored at every curve
-point. At p=0 there is no finetune phase. Each phase early-stops on a stratified
-15% slice of its own training rows and uses balanced class weights.
-
-Backbone features and the pool pretrain state are cached under the run's artifact
-directory; see the cache notes below.
+The input is the serialized row and the output is the head's K-way softmax; there
+is no prompting or generation. Cross-state runs pretrain on the source pool and,
+at p > 0, fine-tune on the target adaptation rows. `--within-cv K` runs K-fold CV
+within one state instead.
 
     python transfer_llm_cls.py --pool-sources WI=data/wi_records_cleaned_raw.csv ... \\
         --target data/nc_records_cleaned_raw.csv --tgt-name NC --rating-scale 5star \\
         --adapt head --target-frac 0.2
     python transfer_llm_cls.py --within-cv 5 --adapt lora \\
         --source data/nc_records_cleaned_raw.csv --target data/nc_records_cleaned_raw.csv \\
-        --src-name NC --tgt-name NC
+        --src-name NC --tgt-name NC --rating-scale 5star
 """
 from __future__ import annotations
 
 import argparse
-import copy
+import hashlib
+import itertools
+import os
 import shutil
 import sys
 import time
@@ -43,6 +36,7 @@ _SRC = Path(__file__).resolve().parent
 sys.path.insert(0, str(_SRC))
 
 from transfer_common import (  # noqa: E402
+    _resolve_transfer_output,
     add_transfer_args,
     balanced_class_weights,
     bootstrap_target_std,
@@ -73,16 +67,7 @@ from llm import (  # noqa: E402
 from llm_common import class_medoid_exemplar_indices  # noqa: E402
 from utils import SEED, compute_metrics, run_artifact_dir  # noqa: E402
 
-import hashlib  # noqa: E402
-import itertools  # noqa: E402
-import os  # noqa: E402
-
-# Checkpoint for the trained-head methods: dense Qwen3-4B. This is a LOCAL
-# directory, not a HuggingFace repo id, because compute nodes generally have no
-# outbound network access during a job -- fetch it first with `download_qwen.py`.
-#
-# Resolution order: --model, then $LLM_CLS_MODEL, then models/qwen3_4b inside the
-# repository, so a fresh checkout needs no configuration beyond the download.
+# A local directory (fetch with download_qwen.py); --model and $LLM_CLS_MODEL override.
 DEFAULT_CLS_LLM_PATH = (
     os.environ.get("LLM_CLS_MODEL")
     or str(Path(__file__).resolve().parent / "models" / "qwen3_4b")
@@ -97,39 +82,22 @@ LORA_LR = float(os.environ.get("CCQ_LLMCLS_LORA_LR", "1e-4"))
 WARMUP_RATIO = 0.1
 
 # -----------------------------------------------------------------------------
-# Caches
+# Caches (under the run's artifact directory)
 # -----------------------------------------------------------------------------
-# Both live under run_artifact_dir(--output), so concurrent jobs writing
-# different outputs do not share them.
-#
-#   PRETRAIN cache  the pooled-source pretrain phase does not depend on p, so it
-#     is computed once and reloaded at every curve point.
-#   FEATURE cache   with --adapt head the backbone is frozen, so pooled hidden
-#     states are extracted once and the head trains on the cached vectors. Exact
-#     only when no backbone dropout is active, checked by
-#     _backbone_is_deterministic.
+# PRETRAIN: the pooled-source pretrain does not depend on p, so it is computed once.
+# FEATURE: with --adapt head the backbone is frozen, so pooled hidden states are
+# extracted once and the head trains on them. Exact only without active dropout.
 PRETRAIN_CACHE = os.environ.get("CCQ_LLMCLS_PRETRAIN_CACHE", "1") == "1"
 FEATURE_CACHE = os.environ.get("CCQ_LLMCLS_FEATURE_CACHE", "1") == "1"
-# Tolerance for the guard that cached features reproduce the model's own logits.
+# Tolerance for the check that cached features reproduce the model's logits:
+# atol + rtol * |logits|max, since bf16 error scales with the logit magnitude.
 FEATURE_CHECK_ATOL = float(os.environ.get("CCQ_LLMCLS_FEATURE_ATOL", "2e-2"))
-# Relative term, added to the absolute one. bf16 has an 8-bit
-# mantissa, so a 2560-wide matmul accumulates an error PROPORTIONAL to the
-# logit magnitude — a fixed atol cannot separate that from a genuinely wrong
-# pooled position. 5% of |logits|max sits ~2x above the noise actually observed
-# (0.020-0.041 on logits of order 1) and ~20x below a mispooling error.
 FEATURE_CHECK_RTOL = float(os.environ.get("CCQ_LLMCLS_FEATURE_RTOL", "5e-2"))
-# Bumped whenever the extraction MATH changes, so stale entries miss by
-# construction. The device and precision are part of the digest as well: fp32
-# vectors computed on CPU and bf16 vectors computed under autocast are not
-# interchangeable, and nothing else in the key distinguishes them.
 _FEATURE_CACHE_VERSION = 2
 
 
 def _digest_texts(texts, *scalars) -> str:
-    """Stable md5 over the exact strings a phase will consume plus the scalar
-    knobs that change the resulting weights. Streamed so a 25k-row pool does not
-    materialise a giant repr. Same stdlib-md5 convention as the embedding cache: any serialization change is a cache MISS by
-    construction rather than a silent stale hit."""
+    """md5 over the exact strings plus the scalars that affect the result."""
     h = hashlib.md5()
     for s in scalars:
         h.update(repr(s).encode("utf-8"))
@@ -145,18 +113,9 @@ _TMP_SEQ = itertools.count()
 
 
 def _atomic_save(obj, path: Path, saver) -> None:
-    """Write via a temp file + os.replace so a killed job never leaves a
-    half-written cache entry that a later job would happily load.
-
-    ``saver(obj, tmp)`` must write to exactly ``tmp``. ``np.save`` appends
-    ``.npy`` when the path does not already end in it, so the existence check
-    below reports that as a clear error rather than a FileNotFoundError from
-    ``os.replace``.
-    """
+    """Write via a unique temp file + os.replace, so a killed job never leaves a
+    half-written cache entry. ``saver(obj, tmp)`` must write to exactly ``tmp``."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    # Unique per CALL, not merely per process. A failed write leaves its temp
-    # behind, and a later write in the same process would otherwise find that
-    # stale file at the pid-derived name and rename IT over the good entry.
     tmp = path.with_suffix(path.suffix + f".tmp{os.getpid()}_{next(_TMP_SEQ)}")
     try:
         saver(obj, tmp)
@@ -167,8 +126,6 @@ def _atomic_save(obj, path: Path, saver) -> None:
                 f"path (np.save appends '.npy' — pass an open file handle).")
         os.replace(tmp, path)
     finally:
-        # Reached with tmp present only when the write failed; a successful
-        # os.replace has already consumed it.
         if tmp.exists():
             try:
                 tmp.unlink()
@@ -177,13 +134,13 @@ def _atomic_save(obj, path: Path, saver) -> None:
 
 
 def _np_save(arr, path) -> None:
-    """np.save to an EXACT path (a file handle stops it appending '.npy')."""
+    """np.save to an exact path (a file handle stops it appending '.npy')."""
     with open(path, "wb") as fh:
         np.save(fh, arr, allow_pickle=False)
 
 
 # -----------------------------------------------------------------------------
-# RAG input construction (plain text, no chat template)
+# RAG input construction
 # -----------------------------------------------------------------------------
 def _embed_texts(texts, model_name, device):
     from sentence_transformers import SentenceTransformer
@@ -211,10 +168,8 @@ def _rag_wrap(query_texts, pool_texts, pool_y_idx, pool_emb, idx_to_label,
               max_chars, self_positions=None):
     """Prefix every query text with per-class medoid exemplars from the pool.
 
-    self_positions: optional array mapping each query row to its position in the
-    pool (when the queries ARE pool rows, e.g. training on the exemplar pool) so
-    a row is never its own exemplar — rows that are their class medoid get that
-    class's runner-up instead. None = queries disjoint from the pool (eval).
+    `self_positions` gives each query's position in the pool when the queries are
+    pool rows, so a row is never its own exemplar.
     """
     pool_vals = [idx_to_label[int(i)] for i in pool_y_idx]
     global_rep = class_medoid_exemplar_indices(pool_emb, pool_y_idx)
@@ -241,19 +196,14 @@ def _load_cls_model(model_name, n_classes, adapt, tokenizer,
                     lora_r=16, lora_alpha=32, lora_dropout=0.05):
     from transformers import AutoModelForSequenceClassification
 
-    # fp32 weights with bf16/fp16 AUTOCAST via TrainingArguments -- the same
-    # mixed-precision pattern MBERT uses here. Loading the backbone in bf16 and
-    # casting the head to fp32 instead would crash the first forward on a Linear
-    # dtype mismatch.
+    # fp32 weights; mixed precision comes from autocast in TrainingArguments.
     model = AutoModelForSequenceClassification.from_pretrained(
         model_name, num_labels=n_classes)
-    # Qwen has no pad token; seq-cls pools the LAST NON-PAD position, which
-    # requires config.pad_token_id to be set or every padded batch mispools.
+    # The head pools the last non-pad position, which needs pad_token_id set.
     model.config.pad_token_id = tokenizer.pad_token_id
 
-    # Place the model on the accelerator at construction. With --adapt head the
-    # Trainer is handed only _HeadOnly(model.score), so leaving placement to it
-    # would move the head and strand the backbone on CPU.
+    # Place the model now: with cached features the Trainer only sees the head,
+    # and would otherwise move it away from the backbone.
     model = model.to(DEVICE)
 
     if adapt == "head":
@@ -283,9 +233,7 @@ def _load_cls_model(model_name, n_classes, adapt, tokenizer,
 
 def _phase(model, tokenizer, tr_texts, tr_labels, va_texts, va_labels,
            n_classes, idx_to_label, classes_sorted, lr, phase_dir):
-    """One fine-tuning phase: train on (tr), best-by-QWK on (va), restore best.
-    Mirrors transfer_plm's sequential _phase; scoring uses the sampler-proof
-    predict pairing everywhere else in this file."""
+    """Train on (tr), early-stop by QWK on (va), restore the best epoch."""
     import torch
     from transformers import DataCollatorWithPadding
 
@@ -316,7 +264,7 @@ def _phase(model, tokenizer, tr_texts, tr_labels, va_texts, va_labels,
         learning_rate=lr, warmup_ratio=WARMUP_RATIO, weight_decay=0.01,
         eval_strategy="epoch", save_strategy="no", logging_steps=50, seed=SEED,
         report_to=[], dataloader_num_workers=NUM_WORKERS,
-        fp16=USE_FP16, bf16=USE_BF16,  # autocast over fp32 weights (MBERT pattern)
+        fp16=USE_FP16, bf16=USE_BF16,
     )
     WeightedTrainer = _make_weighted_trainer_class(cw)
     keeper = make_best_model_keeper(metric="eval_qwk", greater_is_better=True,
@@ -335,12 +283,10 @@ def _phase(model, tokenizer, tr_texts, tr_labels, va_texts, va_labels,
 
 
 def _predict(trainer, tokenizer, texts, labels, idx_to_label):
-    """Score texts -> (y_true, y_pred, proba), paired via label_ids (sampler-proof)."""
+    """Score texts -> (y_true, y_pred, proba), with labels paired by the Trainer."""
     ds = _TextDataset(tokenizer(list(texts), truncation=True, padding=False,
                                 max_length=MAX_LEN), np.asarray(labels))
     logits, out_labels = predict_with_labels(trainer, ds)
-    # Same drift guard transfer_plm._predict_trainer carries: label_ids must be a
-    # permutation of the dataset's labels.
     if not np.array_equal(np.sort(out_labels),
                           np.sort(np.asarray(labels).astype(np.int64))):
         raise RuntimeError("predict label_ids are not a permutation of the "
@@ -354,33 +300,20 @@ def _predict(trainer, tokenizer, texts, labels, idx_to_label):
 
 
 def _trainable_state(model):
-    """CPU copy of the TRAINABLE parameters only — the restore payload.
+    """CPU copy of the trainable parameters, restored with ``strict=False``.
 
-    Copying the full ``state_dict()`` would move roughly 16 GB of frozen fp32
-    Qwen3-4B weights, for every in-RAM snapshot and every cached entry. Nothing
-    outside the trainable set can move: ``--adapt head`` freezes all but
-    ``score``, LoRA freezes the base weights and trains adapters +
-    ``modules_to_save``, and Qwen has no training-mutated buffers (no
-    BatchNorm). So the trainable parameters ARE the delta, and every restore
-    site pairs this with ``strict=False``.
+    Only these can change during training, and a full state dict is ~16 GB.
     """
     return {k: v.detach().cpu().clone()
             for k, v in model.named_parameters() if v.requires_grad}
 
 
 # -----------------------------------------------------------------------------
-# Pretrain-state cache (speedup #1)
+# Pretrain-state cache
 # -----------------------------------------------------------------------------
 def _pretrain_cache_path(args, cache_dir: Path, variant: str, tr_texts, tr_labels,
                          va_texts, va_labels, n_classes, lr) -> Path:
-    """Path for the post-pretrain state of THIS exact computation.
-
-    The digest covers everything that can change the resulting weights: the
-    checkpoint, the adaptation mode (and LoRA geometry), the exact train/val
-    texts and labels of the pretrain phase, the class count, and every
-    optimisation knob including the autocast precision. Anything not in the key
-    is something that provably cannot move the weights.
-    """
+    """Cache path keyed on everything that can change the pretrained weights."""
     key = _digest_texts(
         list(tr_texts) + list(va_texts),
         args.model, args.adapt,
@@ -395,7 +328,7 @@ def _pretrain_cache_path(args, cache_dir: Path, variant: str, tr_texts, tr_label
 
 
 def _load_pretrain_state(path: Path):
-    """Return the cached state dict, or None on a miss / unreadable entry."""
+    """Cached state dict, or None on a miss."""
     if not (PRETRAIN_CACHE and path.exists()):
         return None
     import torch
@@ -416,15 +349,11 @@ def _save_pretrain_state(model, path: Path) -> None:
         _atomic_save(_trainable_state(model), path, torch.save)
         print(f"  [pretrain-cache] saved -> {path}")
     except Exception as exc:                                    # noqa: BLE001
-        # A cache write failure must never take down a run that already did the
-        # expensive part; the next job just re-pretrains.
         print(f"  [pretrain-cache] WARNING: could not save {path.name}: {exc}")
 
 
 def _predict_only_trainer(model, tokenizer, phase_dir: Path):
-    """Trainer used purely for .predict() when the pretrain phase was served
-    from cache and no training Trainer was constructed. Same TrainingArguments
-    as _phase so batching/precision/pairing behave identically."""
+    """Predict-only Trainer for a cache-served pretrain, with _phase's arguments."""
     from transformers import DataCollatorWithPadding
     phase_dir.mkdir(parents=True, exist_ok=True)
     args_hf = make_training_arguments(
@@ -445,17 +374,11 @@ def _predict_only_trainer(model, tokenizer, phase_dir: Path):
 
 
 # -----------------------------------------------------------------------------
-# Frozen-backbone feature cache (speedup #2) — `--adapt head` only
+# Frozen-backbone feature cache (--adapt head only)
 # -----------------------------------------------------------------------------
 def _backbone_is_deterministic(model) -> bool:
-    """True iff no active dropout remains anywhere in the model.
-
-    Caching features is EXACT only if the backbone returns the same vector for a
-    row on every epoch. HF Trainer puts the whole model in train() mode, so any
-    nn.Dropout with p>0 would resample per epoch and the cache would silently
-    change the method. Qwen3 ships attention/hidden dropout at 0.0, but the
-    checkpoint is a runtime input — so this is checked, not assumed.
-    """
+    """True iff the model has no active dropout, so cached features equal
+    train-mode features."""
     import torch.nn as nn
     live = [f"{name or '<root>'}(p={m.p})"
             for name, m in model.named_modules()
@@ -486,12 +409,7 @@ class _FeatureDataset:
 
 
 def _make_head_module(score):
-    """Wrap the trained K-way head so it consumes precomputed features.
-
-    Shares the SAME nn.Linear object as the full model's `score`, so training
-    this module trains the real head in place and the full model stays usable
-    for anything downstream.
-    """
+    """Wrap the model's own `score` Linear so it trains on precomputed features."""
     import torch.nn as nn
     from transformers.modeling_outputs import SequenceClassifierOutput
 
@@ -502,11 +420,7 @@ def _make_head_module(score):
 
         def forward(self, features=None, labels=None, **_):
             logits = self.score(features)
-            # Return a loss whenever labels are passed. Training does not reach
-            # this branch (the weighted trainer pops "labels" first); it exists
-            # for the plain Trainer in _phase_features_predictor, whose
-            # compute_loss requires a model-side loss. The value is discarded by
-            # predict_with_labels.
+            # The plain predict-only Trainer requires a model-side loss.
             loss = None
             if labels is not None:
                 loss = nn.functional.cross_entropy(
@@ -517,13 +431,10 @@ def _make_head_module(score):
 
 
 def _extract_features(model, tokenizer, texts):
-    """Pooled hidden states the seq-cls head consumes, one row per text.
+    """Pooled hidden states the head consumes, one row per text.
 
-    Rather than reimplementing (and guessing at) the head's position-pooling
-    rule and the tokenizer's padding side, this runs the real model, asks for
-    hidden states, derives the pooled vector, and then VERIFIES that
-    `score(pooled)` reproduces the model's own logits. A mismatch raises instead
-    of silently caching the wrong vectors.
+    Verifies that `score(pooled)` reproduces the model's own logits, and raises
+    rather than caching the wrong vectors.
     """
     import torch
     from transformers import DataCollatorWithPadding
@@ -531,17 +442,10 @@ def _extract_features(model, tokenizer, texts):
     collator = DataCollatorWithPadding(tokenizer=tokenizer)
     enc = tokenizer(list(texts), truncation=True, padding=False, max_length=MAX_LEN)
     n = len(texts)
-    order = np.argsort([len(x) for x in enc["input_ids"]])   # length-sorted: less padding
+    order = np.argsort([len(x) for x in enc["input_ids"]])
     was_training = model.training
     model.eval()
     score = model.score if hasattr(model, "score") else model.base_model.model.score
-    # Tripwire: _make_head_module hands the head-only Trainer the
-    # SAME nn.Linear the full model uses, and HF Trainer calls .to(args.device)
-    # on whatever model it is given. If that device ever diverges from the
-    # backbone's, the hidden states and the head land on different devices and
-    # the forward fails deep inside transformers. Fail here instead, naming the
-    # cause. _load_cls_model places the model on DEVICE, so this is unreachable
-    # unless that changes.
     if score.weight.device != model.device:
         raise RuntimeError(
             f"backbone is on {model.device} but the classification head is on "
@@ -551,7 +455,6 @@ def _extract_features(model, tokenizer, texts):
             f"TrainingArguments resolves to the same device.")
     out = None
     t0 = time.time()
-    # Match the training-time forward: bf16/fp16 autocast over fp32 weights.
     amp_dtype = torch.bfloat16 if USE_BF16 else (torch.float16 if USE_FP16 else None)
     try:
         for start in range(0, n, EVAL_BATCH_SIZE):
@@ -564,20 +467,12 @@ def _extract_features(model, tokenizer, texts):
                         res = model(**batch, output_hidden_states=True)
                 else:
                     res = model(**batch, output_hidden_states=True)
-            hs = res.hidden_states[-1]                        # (B, T, H), post-norm
+            hs = res.hidden_states[-1]
             mask = batch["attention_mask"]
-            # The head pools ONE position per row; which one depends on the
-            # tokenizer's padding side. Try both, keep whichever actually
-            # reproduces the model's logits (checked, not assumed).
+            # The pooled position depends on the padding side: try both.
             right = mask.sum(-1) - 1
             left = torch.full_like(right, hs.shape[1] - 1)
             b = torch.arange(hs.shape[0], device=hs.device)
-            # Tolerance is SCALE-RELATIVE. The check exists to catch a WRONG
-            # POOLED POSITION, which produces an error the size of the logits
-            # themselves, and it must not fire on bf16 accumulation noise, which
-            # scales with |logits|. A flat absolute tolerance cannot separate the
-            # two: under autocast the noise reaches a few percent of |logits|,
-            # while a mispooled position is off by O(1).
             scale = res.logits.float().abs().max().item()
             tol = FEATURE_CHECK_ATOL + FEATURE_CHECK_RTOL * scale
             pooled, best_err = None, None
@@ -615,18 +510,10 @@ _FEATURE_MEMO: dict[str, "np.ndarray"] = {}
 
 
 def _features_for(model, tokenizer, texts, cache_dir: Path, model_name: str):
-    """Cached wrapper around _extract_features, keyed on the exact strings.
+    """_extract_features with an in-process memo and an on-disk cache.
 
-    Two layers: an in-process memo (the same text block is asked for more than
-    once per run — e.g. the eval block is fetched again at predict time, and a
-    ~25k x 2560 fp32 array is ~250 MB to re-read), and the on-disk cache that
-    survives across the curve points and across jobs.
+    DEVICE is in the key: autocast applies only on cuda, so CPU and GPU features differ.
     """
-    # DEVICE and the cache version are part of the key. USE_BF16/USE_FP16 record
-    # the INTENT to autocast, but autocast only applies when the model sits on
-    # cuda, so a CPU run produces fp32 vectors that must not share a key with
-    # autocast-computed ones -- mixing them would shift the head's inputs between
-    # train and test.
     key = _digest_texts(texts, model_name, MAX_LEN, USE_BF16, USE_FP16,
                         DEVICE, _FEATURE_CACHE_VERSION)
     if key in _FEATURE_MEMO:
@@ -653,13 +540,7 @@ def _features_for(model, tokenizer, texts, cache_dir: Path, model_name: str):
 
 def _phase_features(model, tr_feats, tr_labels, va_feats, va_labels,
                     n_classes, idx_to_label, classes_sorted, lr, phase_dir):
-    """_phase, but over precomputed features and training ONLY the K-way head.
-
-    Deliberately reuses the same TrainingArguments, the same class-weighted
-    Trainer subclass, and the same best-by-QWK RAM keeper as the text path, so
-    the optimisation protocol is unchanged — only the (frozen, hence constant)
-    backbone forward pass is skipped.
-    """
+    """_phase over precomputed features, training only the head."""
     import torch
     from transformers import default_data_collator
 
@@ -707,8 +588,7 @@ def _phase_features(model, tr_feats, tr_labels, va_feats, va_labels,
 
 
 def _phase_features_predictor(model, phase_dir: Path):
-    """Feature-path analogue of _predict_only_trainer: wraps the (already
-    restored) head so a cache-served pretrain can still be scored."""
+    """Feature-path analogue of _predict_only_trainer."""
     from transformers import Trainer, default_data_collator
     phase_dir.mkdir(parents=True, exist_ok=True)
     args_hf = make_training_arguments(
@@ -727,7 +607,7 @@ def _phase_features_predictor(model, phase_dir: Path):
 
 
 def _predict_features(trainer, feats, labels, idx_to_label):
-    """_predict over cached features; same sampler-proof label pairing."""
+    """_predict over cached features."""
     ds = _FeatureDataset(feats, labels)
     logits, out_labels = predict_with_labels(trainer, ds)
     if not np.array_equal(np.sort(out_labels),
@@ -746,11 +626,9 @@ def _predict_features(trainer, feats, labels, idx_to_label):
 # Runner
 # -----------------------------------------------------------------------------
 def run_transfer_cls(data, args, models_dir):
-    import torch
     from transformers import AutoTokenizer
 
-    cv_folds = args.target_cv_folds
-    PCT = 100 if cv_folds > 0 else int(round(args.target_frac * 100))
+    PCT = int(round(args.target_frac * 100))
     variant = "cls_rag" if args.rag else ("cls_lora" if args.adapt == "lora" else "cls")
     method = (f"xfer_qwen_{variant}{scale_infix(data.scale)}"
               f"_tgt{PCT}_{data.src_name}2{data.tgt_name}")
@@ -772,7 +650,6 @@ def run_transfer_cls(data, args, models_dir):
     src_texts = data.src_texts.tolist()
     tgt_texts = data.tgt_texts.tolist()
 
-    # --- RAG embeddings (once; MiniLM, the shared featurizer) ---------------
     src_emb = tgt_emb = None
     if args.rag:
         dev = "cuda" if (DEVICE == "cuda") else "cpu"
@@ -787,7 +664,7 @@ def run_transfer_cls(data, args, models_dir):
                          data.idx_to_label, args.max_exemplar_chars, qpos)
 
     def rag_tgt_pool(qtexts, pool_pos, qpos_in_pool=None):
-        """Exemplars from the TARGET rows at positions pool_pos."""
+        """Exemplars drawn from the target rows at `pool_pos`."""
         pool_t = [tgt_texts[int(i)] for i in pool_pos]
         pool_y = data.y_tgt[pool_pos]
         pool_e = tgt_emb[pool_pos]
@@ -798,12 +675,7 @@ def run_transfer_cls(data, args, models_dir):
     model = _load_cls_model(args.model, data.n_classes, args.adapt, tokenizer,
                             args.lora_r, args.lora_alpha, args.lora_dropout)
 
-    # --- cache setup -------------------------------------------
-    # Both caches live under the per-target artifact subtree, so concurrent
-    # per-target jobs never share (or clobber) an entry.
     cache_dir = run_artifact_dir(args.output) / "llm_cls_cache"
-    # Feature caching applies ONLY when the backbone is frozen (--adapt head,
-    # with or without --rag) AND nothing in it is stochastic.
     use_feats = (FEATURE_CACHE and args.adapt == "head"
                  and _backbone_is_deterministic(model))
     if use_feats:
@@ -831,102 +703,58 @@ def run_transfer_cls(data, args, models_dir):
         return _predict(trainer, tokenizer, texts, labels, data.idx_to_label)
 
     def pretrain_phase(tr_texts, tr_y, va_texts, va_y):
-        """The pooled-source pretrain, served from cache when it has already
-        been computed for this exact (pool, variant, hyperparameter) tuple.
-        Identical at every curve point, so this is a straight 1-of-N saving."""
+        """Pool pretrain, served from cache when available; returns None on a hit."""
         path = _pretrain_cache_path(args, cache_dir, variant, tr_texts,
                                     tr_y, va_texts, va_y, data.n_classes, lr)
         state = _load_pretrain_state(path)
         if state is not None:
-            model.load_state_dict(state, strict=False)   # delta-only payload
-            return None                     # caller builds a trainer if it needs one
+            model.load_state_dict(state, strict=False)
+            return None
         tr = phase(tr_texts, tr_y, va_texts, va_y, "pretrain")
         _save_pretrain_state(model, path)
         return tr
 
-    if cv_folds > 0:
-        # p=100: pretrain ONCE on the full pool, then per-fold finetune+predict.
+    adapt_idx, test_idx = split_target_fewshot(
+        data.y_tgt, args.target_frac, args.target_test_frac, seed)
+    print(f"  target split: adapt={len(adapt_idx)}  test={len(test_idx)}")
+    if PCT == 0:
+        # Zero-shot: pretrain on the pool only; no fine-tune phase.
         p_tr, p_va = stratified_source_split(data.y_src, args.val_frac, seed)
-        tr_texts = rag_src([src_texts[i] for i in p_tr], p_tr) if args.rag \
-            else [src_texts[i] for i in p_tr]
-        va_texts = rag_src([src_texts[i] for i in p_va], p_va) if args.rag \
-            else [src_texts[i] for i in p_va]
-        pretrain_phase(tr_texts, data.y_src[p_tr], va_texts, data.y_src[p_va])
-        pre_state = _trainable_state(model)
-
-        folds = target_cv_folds(data.y_tgt, cv_folds, seed)
-        yt, yp, pr = [], [], []
-        for fi, (tr, te) in enumerate(folds, 1):
-            print(f"\n  -- fold {fi}/{len(folds)}: target train={len(tr)} "
-                  f"test={len(te)} --")
-            model.load_state_dict(pre_state, strict=False)  # delta-only, see _trainable_state
-            s_tr, s_va = stratified_source_split(data.y_tgt[tr], args.val_frac, seed)
-            f_tr, f_va = tr[s_tr], tr[s_va]
-            if args.rag:
-                ftr = rag_tgt_pool([tgt_texts[i] for i in f_tr], tr,
-                                   [int(np.where(tr == i)[0][0]) for i in f_tr])
-                fva = rag_tgt_pool([tgt_texts[i] for i in f_va], tr,
-                                   [int(np.where(tr == i)[0][0]) for i in f_va])
-                fte = rag_tgt_pool([tgt_texts[i] for i in te], tr)
-            else:
-                ftr = [tgt_texts[i] for i in f_tr]
-                fva = [tgt_texts[i] for i in f_va]
-                fte = [tgt_texts[i] for i in te]
-            trainer = phase(ftr, data.y_tgt[f_tr], fva, data.y_tgt[f_va],
-                            f"fold{fi}")
-            a, b, c = predict(trainer, fte, data.y_tgt[te])
-            yt.append(a); yp.append(b); pr.append(c)
-        y_true = np.concatenate(yt); y_pred = np.concatenate(yp)
-        y_proba = np.concatenate(pr, axis=0)
-    else:
-        adapt_idx, test_idx = split_target_fewshot(
-            data.y_tgt, args.target_frac, args.target_test_frac, seed)
-        print(f"  target split: adapt={len(adapt_idx)}  test={len(test_idx)}")
-        if PCT == 0:
-            # Zero-shot: pretrain on the FULL pool and stop. No target labels
-            # exist at p=0, so there is no finetune phase -- which is precisely
-            # the source-only pretrain point that MBERT, MBERT-CORN and TabNN
-            # report, and is what makes the p=0 row comparable ACROSS method
-            # families rather than only down this method's own curve.
-            p_tr, p_va = stratified_source_split(data.y_src, args.val_frac, seed)
-            if args.rag:
-                ptr = rag_src([src_texts[i] for i in p_tr], p_tr)
-                pva = rag_src([src_texts[i] for i in p_va], p_va)
-                # Eval exemplars at p=0: the SOURCE pool (no target labels).
-                te_texts = rag_src([tgt_texts[i] for i in test_idx])
-            else:
-                ptr = [src_texts[i] for i in p_tr]; pva = [src_texts[i] for i in p_va]
-                te_texts = [tgt_texts[i] for i in test_idx]
-            trainer = pretrain_phase(ptr, data.y_src[p_tr], pva, data.y_src[p_va])
-            if trainer is None:
-                # Served from cache: no training Trainer was built, so make a
-                # predict-only one over the restored weights.
-                trainer = (_phase_features_predictor(model, models_dir / method / "pretrain")
-                           if use_feats
-                           else _predict_only_trainer(model, tokenizer,
-                                                      models_dir / method / "pretrain"))
+        if args.rag:
+            ptr = rag_src([src_texts[i] for i in p_tr], p_tr)
+            pva = rag_src([src_texts[i] for i in p_va], p_va)
+            te_texts = rag_src([tgt_texts[i] for i in test_idx])
         else:
-            p_tr, p_va = stratified_source_split(data.y_src, args.val_frac, seed)
-            s_tr, s_va = stratified_source_split(data.y_tgt[adapt_idx],
-                                                 args.val_frac, seed)
-            a_tr, a_va = adapt_idx[s_tr], adapt_idx[s_va]
-            if args.rag:
-                ptr = rag_src([src_texts[i] for i in p_tr], p_tr)
-                pva = rag_src([src_texts[i] for i in p_va], p_va)
-                pos_in_adapt = {int(g): k for k, g in enumerate(adapt_idx)}
-                ftr = rag_tgt_pool([tgt_texts[i] for i in a_tr], adapt_idx,
-                                   [pos_in_adapt[int(i)] for i in a_tr])
-                fva = rag_tgt_pool([tgt_texts[i] for i in a_va], adapt_idx,
-                                   [pos_in_adapt[int(i)] for i in a_va])
-                te_texts = rag_tgt_pool([tgt_texts[i] for i in test_idx], adapt_idx)
-            else:
-                ptr = [src_texts[i] for i in p_tr]; pva = [src_texts[i] for i in p_va]
-                ftr = [tgt_texts[i] for i in a_tr]; fva = [tgt_texts[i] for i in a_va]
-                te_texts = [tgt_texts[i] for i in test_idx]
-            pretrain_phase(ptr, data.y_src[p_tr], pva, data.y_src[p_va])
-            trainer = phase(ftr, data.y_tgt[a_tr], fva, data.y_tgt[a_va],
-                            "finetune")
-        y_true, y_pred, y_proba = predict(trainer, te_texts, data.y_tgt[test_idx])
+            ptr = [src_texts[i] for i in p_tr]; pva = [src_texts[i] for i in p_va]
+            te_texts = [tgt_texts[i] for i in test_idx]
+        trainer = pretrain_phase(ptr, data.y_src[p_tr], pva, data.y_src[p_va])
+        if trainer is None:
+            trainer = (_phase_features_predictor(model, models_dir / method / "pretrain")
+                       if use_feats
+                       else _predict_only_trainer(model, tokenizer,
+                                                  models_dir / method / "pretrain"))
+    else:
+        p_tr, p_va = stratified_source_split(data.y_src, args.val_frac, seed)
+        s_tr, s_va = stratified_source_split(data.y_tgt[adapt_idx],
+                                             args.val_frac, seed)
+        a_tr, a_va = adapt_idx[s_tr], adapt_idx[s_va]
+        if args.rag:
+            ptr = rag_src([src_texts[i] for i in p_tr], p_tr)
+            pva = rag_src([src_texts[i] for i in p_va], p_va)
+            pos_in_adapt = {int(g): k for k, g in enumerate(adapt_idx)}
+            ftr = rag_tgt_pool([tgt_texts[i] for i in a_tr], adapt_idx,
+                               [pos_in_adapt[int(i)] for i in a_tr])
+            fva = rag_tgt_pool([tgt_texts[i] for i in a_va], adapt_idx,
+                               [pos_in_adapt[int(i)] for i in a_va])
+            te_texts = rag_tgt_pool([tgt_texts[i] for i in test_idx], adapt_idx)
+        else:
+            ptr = [src_texts[i] for i in p_tr]; pva = [src_texts[i] for i in p_va]
+            ftr = [tgt_texts[i] for i in a_tr]; fva = [tgt_texts[i] for i in a_va]
+            te_texts = [tgt_texts[i] for i in test_idx]
+        pretrain_phase(ptr, data.y_src[p_tr], pva, data.y_src[p_va])
+        trainer = phase(ftr, data.y_tgt[a_tr], fva, data.y_tgt[a_va],
+                        "finetune")
+    y_true, y_pred, y_proba = predict(trainer, te_texts, data.y_tgt[test_idx])
 
     point = compute_metrics(y_true, y_pred, y_proba=y_proba, labels=data.labels)
     std = bootstrap_target_std(y_true, y_pred, y_proba, labels=data.labels,
@@ -937,7 +765,7 @@ def run_transfer_cls(data, args, models_dir):
           f"qwk={point['qwk']:.3f}  mae={point['mae']:.3f}")
     print(f"  elapsed: {elapsed:.0f}s ({elapsed / 60:.1f} min)")
 
-    model = None   # drop the reference (not `del`: the phase/predict closures capture it)
+    model = None  # closures still reference it, so no `del`
     if DEVICE == "cuda":
         import torch as _t
         _t.cuda.empty_cache()
@@ -946,22 +774,8 @@ def run_transfer_cls(data, args, models_dir):
 
 
 def run_within_cls(data, args, models_dir):
-    """Within-state K-fold CV for the classification-head variants.
-
-    Source and target are the same state. The model is loaded once and a pristine
-    CPU snapshot taken, which each fold restores, so folds share an identical
-    init.
-
-    Per fold: a stratified 15% val carve of the fold's training rows, best-by-QWK
-    keeper with patience 2, balanced class weights, then predict the held-out
-    fold; out-of-fold predictions are concatenated.
-
-    Under ``--rag`` the exemplars are medoids of the fold's training rows only,
-    self-excluded, so a held-out row never contributes one.
-
-    Tags: qwen_cls[_rag|_lora]_within[_5star]_tgt100_<S>.
-    """
-    import torch
+    """Within-state K-fold CV. Every fold starts from the same initial head/LoRA
+    weights; RAG exemplars come from the fold's training rows only."""
     from transformers import AutoTokenizer
 
     state = data.tgt_name
@@ -993,14 +807,8 @@ def run_within_cls(data, args, models_dir):
     t0 = time.time()
     model = _load_cls_model(args.model, data.n_classes, args.adapt, tokenizer,
                             args.lora_r, args.lora_alpha, args.lora_dropout)
-    init_state = _trainable_state(model)  # pristine snapshot, restored per fold
+    init_state = _trainable_state(model)
 
-    # Feature cache: with --adapt head the backbone is frozen, so
-    # the SAME pooled states serve all K folds — one extraction pass instead of
-    # K x EPOCHS backbone passes. NB with --rag the exemplar block is per-fold
-    # (medoids come from the fold's train rows), so each fold's wrapped strings
-    # are distinct and get their own cache entry; the saving there is the 4
-    # epochs within a fold rather than reuse across folds.
     cache_dir = run_artifact_dir(args.output) / "llm_cls_cache"
     use_feats = (FEATURE_CACHE and args.adapt == "head"
                  and _backbone_is_deterministic(model))
@@ -1015,7 +823,7 @@ def run_within_cls(data, args, models_dir):
     yt, yp, pr = [], [], []
     for fi, (tr, te) in enumerate(folds, 1):
         print(f"\n  -- fold {fi}/{len(folds)}: train={len(tr)} test={len(te)} --")
-        model.load_state_dict(init_state, strict=False)  # delta-only, see _trainable_state
+        model.load_state_dict(init_state, strict=False)
         s_tr, s_va = stratified_source_split(y[tr], args.val_frac, seed)
         f_tr, f_va = tr[s_tr], tr[s_va]
         if args.rag:
@@ -1061,7 +869,7 @@ def run_within_cls(data, args, models_dir):
           f"qwk={point['qwk']:.3f}  mae={point['mae']:.3f}")
     print(f"  elapsed: {elapsed:.0f}s ({elapsed / 60:.1f} min)")
 
-    model = None   # drop the reference (not `del`: the phase/predict closures capture it)
+    model = None
     if DEVICE == "cuda":
         import torch as _t
         _t.cuda.empty_cache()
@@ -1069,109 +877,77 @@ def run_within_cls(data, args, models_dir):
     return method, point, std
 
 
-def _method_tag_from_args(a):
-    variant = "cls_rag" if getattr(a, "rag", False) else (
-        "cls_lora" if getattr(a, "adapt", "head") == "lora" else "cls")
-    infix = scale_infix(getattr(a, "rating_scale", "3star"))
-    if getattr(a, "within_cv", 0) and a.within_cv > 0:  # within-state mode
-        return f"qwen_{variant}_within{infix}_tgt100_{a.tgt_name}"
-    PCT = (100 if getattr(a, "target_cv_folds", 0) > 0
-           else int(round(getattr(a, "target_frac", 0.0) * 100)))
-    src = getattr(a, "pool_name", None) if getattr(a, "pool_sources", None) \
-        else getattr(a, "src_name", None)
-    return f"xfer_qwen_{variant}{infix}_tgt{PCT}_{src}2{a.tgt_name}"
+def _method_tag(args) -> str:
+    variant = "cls_rag" if args.rag else ("cls_lora" if args.adapt == "lora" else "cls")
+    infix = scale_infix(args.rating_scale)
+    if args.within_cv > 0:
+        return f"qwen_{variant}_within{infix}_tgt100_{args.tgt_name}"
+    src = args.pool_name if args.pool_sources else args.src_name
+    pct = int(round(args.target_frac * 100))
+    return f"xfer_qwen_{variant}{infix}_tgt{pct}_{src}2{args.tgt_name}"
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="LLM classification-head transfer (head / +rag / +lora), "
-                    "sequential pretrain->finetune.")
+        description="Qwen3 classification-head transfer (head / +rag / +lora).")
     add_transfer_args(parser)
     parser.add_argument("--adapt", choices=("head", "lora"), default="head",
-                        help="'head': frozen backbone, train only the K-way head. "
-                             "'lora': LoRA adapters + head (task_type SEQ_CLS).")
+                        help="'head': frozen backbone, train the K-way head only. "
+                             "'lora': LoRA adapters + head.")
     parser.add_argument("--rag", action="store_true",
-                        help="Prefix every input with per-class medoid exemplars "
-                             "(pretrain/finetune pools; see module docstring).")
+                        help="Prefix every input with per-class medoid exemplars.")
     parser.add_argument("--model", default=DEFAULT_CLS_LLM_PATH,
-                        help=f"Dense Qwen checkpoint (default {DEFAULT_CLS_LLM_PATH}; "
-                             "fetch with download_qwen.py --repo-id Qwen/Qwen3-4B).")
+                        help=f"Local Qwen checkpoint (default {DEFAULT_CLS_LLM_PATH}).")
     parser.add_argument("--embed-model",
                         default="sentence-transformers/all-MiniLM-L6-v2",
-                        help="Embedder for --rag medoid selection (shared MiniLM).")
+                        help="Embedder for --rag medoid selection.")
     parser.add_argument("--max-exemplar-chars", type=int, default=1200)
-    # Accepted and ignored. This once carved a fraction of the pool into a
-    # manufactured finetune phase at p=0; the zero-shot cell is now a single
-    # pretrain phase on the full pool. The flag survives only so that command
-    # lines recorded in older logs still parse rather than hard-failing.
-    parser.add_argument("--zero-shot-finetune-frac", type=float, default=0.0,
-                        help="Ignored (retained for backward compatibility): p=0 "
-                             "is a single pretrain phase on the full pool.")
     parser.add_argument("--within-cv", type=int, default=0,
-                        help="WITHIN-STATE mode: K-fold CV over ONE "
-                             "state (pass its raw CSV as BOTH --source and --target, "
-                             "same --src-name/--tgt-name). Fresh head/LoRA per fold "
-                             "from a pristine snapshot; --rag draws per-class medoid "
-                             "exemplars from the fold's train rows only. Tag "
-                             "qwen_cls[_rag|_lora]_within[_5star]_tgt100_<S>. "
-                             "0 (default) = normal cross-state transfer.")
+                        help="K-fold CV within one state (pass its CSV as both --source "
+                             "and --target). 0 = cross-state transfer.")
     parser.add_argument("--lora-r", type=int, default=16)
     parser.add_argument("--lora-alpha", type=int, default=32)
     parser.add_argument("--lora-dropout", type=float, default=0.05)
     args = parser.parse_args()
+    if args.within_cv > 0 and args.pool_sources:
+        parser.error("--within-cv is single-state; it cannot take --pool-sources.")
     configure_verbosity(args.verbose)
-
-    if args.within_cv and args.within_cv > 0:
-        if args.pool_sources:
-            parser.error("--within-cv is single-state (source == target); it is "
-                         "incompatible with --pool-sources.")
-        data = load_and_prepare(
-            args.source, args.target, args.src_name, args.tgt_name,
-            text_mode=args.text_mode, compliance_mode=args.compliance,
-            scale=args.rating_scale)
-        models_dir = run_artifact_dir(args.output) / "llm_cls_models"
-        method, point, std = run_within_cls(data, args, models_dir)
-        log_transfer_result(method, point, std, output_path=args.output,
-                            notes=method, source=data.tgt_name,
-                            target=data.tgt_name, classes=data.labels)
-        print(f"\nDone. See {args.output} for within-state LLM-cls scores.")
-        return
-
-    if args.pool_sources:
-        data = load_and_prepare_pooled(
-            parse_pool_sources(args.pool_sources), args.tgt_name, args.target,
-            text_mode=args.text_mode, compliance_mode=args.compliance,
-            scale=args.rating_scale, pool_name=args.pool_name)
-    else:
-        data = load_and_prepare(
-            args.source, args.target, args.src_name, args.tgt_name,
-            text_mode=args.text_mode, compliance_mode=args.compliance,
-            scale=args.rating_scale)
+    _resolve_transfer_output(args, "transfer_llm_cls")
     models_dir = run_artifact_dir(args.output) / "llm_cls_models"
-    method, point, std = run_transfer_cls(data, args, models_dir)
-    log_transfer_result(method, point, std, output_path=args.output, notes=method,
-                        source=data.src_name, target=data.tgt_name,
-                        classes=data.labels)
-    print(f"\nDone. See {args.output} for transfer scores.")
+
+    try:
+        if args.within_cv > 0:
+            data = load_and_prepare(
+                args.source, args.target, args.src_name, args.tgt_name,
+                compliance_mode=args.compliance, scale=args.rating_scale)
+            method, point, std = run_within_cls(data, args, models_dir)
+            source = data.tgt_name
+        else:
+            if args.pool_sources:
+                data = load_and_prepare_pooled(
+                    parse_pool_sources(args.pool_sources), args.tgt_name, args.target,
+                    compliance_mode=args.compliance, scale=args.rating_scale,
+                    pool_name=args.pool_name)
+            else:
+                data = load_and_prepare(
+                    args.source, args.target, args.src_name, args.tgt_name,
+                    compliance_mode=args.compliance, scale=args.rating_scale)
+            method, point, std = run_transfer_cls(data, args, models_dir)
+            source = data.src_name
+        log_transfer_result(method, point, std, output_path=args.output, notes=method,
+                            source=source, target=data.tgt_name, classes=data.labels)
+    except SystemExit:
+        raise
+    except BaseException as exc:  # noqa: BLE001
+        traceback.print_exc()
+        src = (args.tgt_name if args.within_cv > 0
+               else (args.pool_name if args.pool_sources else args.src_name))
+        log_failed_transfer(_method_tag(args), output_path=args.output,
+                            source=src, target=args.tgt_name,
+                            error=f"{type(exc).__name__}: {exc}")
+        raise
+    print(f"\nDone. See {args.output} for results.")
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except SystemExit:
-        raise
-    except BaseException as exc:  # noqa: BLE001 — always leave a FAILED row
-        traceback.print_exc()
-        _p = argparse.ArgumentParser(add_help=False)
-        add_transfer_args(_p)
-        _p.add_argument("--adapt", choices=("head", "lora"), default="head")
-        _p.add_argument("--rag", action="store_true")
-        _p.add_argument("--within-cv", type=int, default=0)
-        _a, _ = _p.parse_known_args()
-        _within = getattr(_a, "within_cv", 0) and _a.within_cv > 0
-        _src = (_a.tgt_name if _within
-                else (_a.pool_name if _a.pool_sources else _a.src_name))
-        log_failed_transfer(_method_tag_from_args(_a), output_path=_a.output,
-                            source=_src, target=_a.tgt_name,
-                            error=f"{type(exc).__name__}: {exc}")
-        raise
+    main()

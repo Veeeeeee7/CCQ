@@ -1,29 +1,12 @@
 """
-sc_capture.py — recon the SC ABC Quality / SC Child Care provider search.
+sc_capture.py — recon the SC Child Care provider search.
 
-WHY THIS EXISTS (Phase 1 recon, 2026-07-08)
--------------------------------------------
-The scraping source (Checkpoint 0 decision) is the state provider directory at
-https://www.scchildcare.org/provider-search/ . It's an Umbraco CMS page whose
-search results are loaded by client-side JavaScript (AJAX) — a plain
-`requests.get()` on /provider-search returns only the empty form scaffold, not
-the provider rows. So before writing the crawler we need to see the REAL request
-the page fires when you search: its URL, method, params, and JSON response
-shape. That tells us:
-
-  * the search endpoint + how to ask for "Search All Providers" (full enumeration),
-  * the provider identifier field  -> becomes `provider_id` (the "Provider Number"
-    / licensing id),
-  * the ABC Quality rating field   -> becomes `qr_rating` (native letter grade
-    C / B / B+ / A / A+, plus P = pending, E = legally-exempt),
-  * whatever bonus fields ride along (address, county, type, capacity, ages,
-    inspection/compliance/deficiency info),
-  * whether a per-provider DETAIL request exists and its URL/id pattern.
-
-This mirrors nc_capture.py: it drives a real browser, records every XHR/fetch
-response body to sc_captures/, saves the rendered results HTML + a screenshot,
-and prints a short summary. It does NOT scrape — it's a one-off inspection so
-sc_crawler.py's selectors/endpoints can be written from real payloads.
+https://www.scchildcare.org/provider-search/ is an Umbraco CMS page whose
+results are loaded by client-side JavaScript (AJAX); a plain `requests.get()`
+returns only the empty form. This drives a real browser, records every
+XHR/fetch response body to sc_captures/, saves the rendered HTML and a
+screenshot, and ranks the captured bodies by how likely they are to be the
+provider-search payload. It does not scrape.
 
 USAGE
 -----
@@ -43,7 +26,7 @@ OUTPUTS (sc_captures/)
     rendered.html        - final DOM after your interaction
     screenshot.png       - full-page screenshot
     network_log.json     - every xhr/fetch: url, method, status, content-type
-    resp_NNN_*.txt       - each captured response body (the JSON we care about)
+    resp_NNN_*.txt       - each captured response body
 
 Deps: pip install playwright beautifulsoup4 && playwright install chromium
 """
@@ -59,9 +42,7 @@ from playwright.sync_api import sync_playwright
 SEARCH_URL = 'https://www.scchildcare.org/provider-search/'
 OUT_DIR = 'sc_captures'
 
-# Content that, if it shows up in a captured response body, almost certainly
-# marks the provider-search payload — used only to point you at the right file
-# in the summary, not to parse anything here.
+# Keywords used only to rank captured bodies in the summary.
 INTEREST_HINTS = ('provider', 'rating', 'quality', 'abcq', 'license',
                    'facility', 'county', 'address')
 
@@ -152,8 +133,8 @@ def capture(manual=False, zip_code=None, headless=False, wait=4.0):
 
 
 def _best_effort_zip(page, zip_code):
-    """Type a zip into the first plausible search box and submit. Markup is
-    unknown until we capture it, so this is deliberately loose — prefer --manual."""
+    """Type a zip into the first plausible search box and submit. Deliberately
+    loose — prefer --manual."""
     for sel in ('input[placeholder*="Zip" i]', 'input[placeholder*="Name" i]',
                 'input[type="text"]', 'input'):
         try:
@@ -185,9 +166,8 @@ def _report(final_url, captured):
         print(f'  [{c.get("interesting", 0)} hits] {c["method"]} '
               f'{c["status"]}  {c["url"]}')
         print(f'        -> {c["body_file"]}  ({c.get("body_len", 0)} bytes)')
-    print('\nNext: open the top-ranked resp_*.txt, confirm the provider_id / '
-          'rating fields, and paste the endpoint URL + a sample record back so '
-          'sc_crawler.py can target the API directly.')
+    print('\nNext: open the top-ranked resp_*.txt and confirm the provider id / '
+          'rating fields.')
 
 
 if __name__ == '__main__':

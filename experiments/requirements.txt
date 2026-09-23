@@ -1,7 +1,7 @@
-# Python 3.11. Install vllm first (it pins torch), then this file:
+# Python 3.11. Install torch for your CUDA build first, then this file:
 #
 #   conda create -n ccq python=3.11 -y
-#   pip install vllm --extra-index-url https://download.pytorch.org/whl/cu128
+#   pip install torch --index-url https://download.pytorch.org/whl/cu128
 #   pip install -r requirements.txt
 #   conda install -y -c conda-forge "ffmpeg>=6,<8"
 #
@@ -36,9 +36,6 @@ coral-pytorch>=1.4
 # Sentence embeddings. Capped below 5.x: it hard-imports torchcodec, which
 # dlopens a CUDA runtime library and fails against a mismatched torch build.
 sentence-transformers>=3.0,<5
-
-# LLM inference backend.
-vllm>=0.8
 
 # Figures.
 matplotlib>=3.7

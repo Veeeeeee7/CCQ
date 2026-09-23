@@ -1,13 +1,11 @@
 """
-clean_full.py — Build the `full` dataset (strictly numeric/boolean + provider_id)
-for classical/tabular ML from the NC DCDEE childcare scrape.
+nc_clean_full.py — Build the `full` dataset (strictly numeric/boolean +
+provider_id) from the NC records, valid 1–5 ratings only.
 
-Pipeline:
   load (as strings) → drop source-error rows → dollar-strip → grain check →
   drop NON_FEATURE_COLS → per-field builders (numeric/boolean only) → finalize.
 
-Run:
-    python clean_full.py --input nc_records_sample.csv --output data/full.csv
+    python nc_clean_full.py
 """
 from __future__ import annotations
 
@@ -35,7 +33,7 @@ def main() -> None:
     print(f"[full] loading {args.input}")
     df = pd.read_csv(args.input, low_memory=False, dtype=str)  # preserve leading zeros
 
-    # --- shared early steps (identical to raw, keeps both row-aligned) -------
+    # --- shared early steps (identical in all four scripts) ------------------
     df = U.drop_error_rows(df, log)
     df = U.strip_dollars(df)
     U.check_grain_unique(df, U.ID_COL, log)
@@ -67,7 +65,8 @@ def main() -> None:
         parts.append(U.build_json_list(df["visits_json"], "visits", "full", log,
                                        categorical_value_keys=["announced"]))
     if "violations_json" in df.columns:
-        parts.append(U.build_json_list(df["violations_json"], "violations", "full", log))
+        parts.append(U.build_json_list(df["violations_json"], "violations", "full", log,
+                                       fetched=df["visits_json"].apply(U._has_value)))
 
     engineered = pd.concat(parts, axis=1)
 

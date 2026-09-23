@@ -8,19 +8,23 @@ COLUMNS_FILE = 'wi_columns.json'
 KEY = 'provider_id'  # provider_location is renamed to provider_id in finalize
 TARGET = 'qr_rating'  # youngstar_star_rating is renamed to qr_rating in finalize
 
-# Discovered-at-runtime boolean families retained by finalize(). Same full
-# scaffold as wi_clean_full.py: complete == full preprocessing, only the target
-# row filter differs (invalid/missing ratings are kept here).
+# Discovered-at-runtime boolean families retained by finalize().
 DYNAMIC_PREFIXES = ('regtype_', 'philosophy_', 'language_', 'service_', 'care_')
 
 
 if __name__ == "__main__":
     df = pd.read_csv(INPUT, low_memory=False)
 
+    # Roster-sourced fields: regulation_type from DCF's Application Type, plus
+    # capacity and age range.
+    df = u.apply_regulation_subtype(df)
+    df = u.build_roster_profile(df)
+
     # Nested JSON -> numeric counts.
     df = u.json_counts(df)
 
     # Single-value categoricals -> one-hot booleans over discovered values.
+    # regulation_type holds the DCF categories by this point.
     df, _ = u.build_categorical_onehot(df, 'regulation_type', 'regtype')
 
     # pr_program_philosophy concatenates multiple philosophies with no delimiter,
@@ -48,7 +52,11 @@ if __name__ == "__main__":
     df = u.parse_vacancies(df)
     df = u.parse_waitlist(df)
 
-    # valid_target_values is omitted, so finalize() keeps every row, including
-    # rows whose qr_rating is invalid (0, 6, 2.5, 'Not Rated', ...) or missing.
+    # No valid_target_values: every row is kept, including invalid/missing ratings.
     df = u.finalize(df, COLUMNS_FILE, 'full', KEY, TARGET, DYNAMIC_PREFIXES)
+    # Nullable Int64: unrated rows hold <NA>, and float64 would write '4.0'.
+    _numeric = pd.to_numeric(df[TARGET], errors='coerce')
+    assert (_numeric.isna() == df[TARGET].isna()).all(), \
+        'a non-numeric rating would be lost by the Int64 cast'
+    df[TARGET] = _numeric.astype('Int64')
     df.to_csv(OUTPUT, index=False)

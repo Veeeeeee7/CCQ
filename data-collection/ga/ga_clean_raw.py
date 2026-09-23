@@ -1,23 +1,15 @@
 """
-ga_clean_raw.py — Build the `raw` dataset (text preserved) for LLM-based methods
-from the GA DECAL childcare scrape.
+ga_clean_raw.py — Build the `raw` dataset (text preserved, valid ratings only)
+from the GA DECAL child care records.
 
-Same early steps and the same row filtering as ga_clean_full.py (so the two
-outputs are row-aligned and a single fold file applies to both), but NO feature
-engineering: the original multi-value / prose columns are kept verbatim. This
-mirrors the original `cleaning_classification_raw.py`, which only:
-
-  strips a leading '$' (and thousands commas) from currency-formatted strings →
-  selects the `raw` scaffold columns → dedups on provider_id →
-  drops unrated rows → removes all-NaN/constant columns.
-
-The per-field builders are still invoked for structural parity with the full
-pipeline, but every one of them is a documented no-op in "raw" mode (it returns
-the frame untouched), so the original text survives into the output.
+Same early steps and row filtering as ga_clean_full.py (so the two outputs are
+row-aligned), but no feature engineering: strips a leading '$' from currency
+strings, selects the `raw` scaffold columns, dedups on provider_id, drops
+unrated rows and removes all-NaN/constant columns. The per-field builders are
+invoked for parity with full but are no-ops in "raw" mode.
 
 Run:
-    python ga_clean_raw.py --input ga_data/ga_records.csv \
-                           --output ga_data/ga_cleaned_raw.csv
+    python ga_clean_raw.py
 """
 from __future__ import annotations
 
@@ -45,10 +37,8 @@ def main() -> None:
     print(f"[raw] loading {args.input}")
     df = pd.read_csv(args.input, low_memory=False)
 
-    # --- shared early steps (identical to full, keeps both row-aligned) ------
-    # NOTE: raw deliberately does NOT run clean_currency; the original raw kept
-    # registration_fee / activity_fee as $-stripped values. strip_dollars handles
-    # the generic plain-$ columns (NC-format behaviour).
+    # raw deliberately does NOT run clean_currency; strip_dollars handles the
+    # plain-$ columns.
     df = U.drop_error_rows(df, log)
     df = U.strip_dollars(df)
     U.check_grain_unique(df, U.ID_COL, log)
@@ -56,7 +46,7 @@ def main() -> None:
                  errors="ignore")
     df = U.coerce_booleans(df, U.BOOLEAN_COLS)
 
-    # --- per-field builders (text-preserving: all no-ops in "raw" mode) ------
+    # per-field builders: all no-ops in "raw" mode
     df = U.clean_licensed_capacity(df, "raw")
     df = U.clean_pre_k_slots(df, "raw")
     df = U.clean_has_liability(df, "raw")

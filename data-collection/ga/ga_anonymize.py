@@ -10,7 +10,7 @@ HERE = Path(__file__).resolve().parent
 DEFAULT_INPUT = HERE / "ga_data" / "ga_records.csv"
 DEFAULT_OUTPUT = HERE / "ga_data" / "ga_records_anonymized.csv"
 LOG_FILE = HERE / "ga_privacy_log.txt"
-MAP_PATH = HERE.parent / "private" / "provider_id_map_ga.csv"
+MAP_PATH = HERE.parent / "data-private" / "provider_id_map_ga.csv"
 
 GRAIN_COL = "provider_id"
 STATE_CODE = "ga"

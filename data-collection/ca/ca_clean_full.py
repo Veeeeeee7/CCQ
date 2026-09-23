@@ -1,12 +1,8 @@
 """
-clean_full.py — Build the `full` dataset (strictly numeric/boolean + provider_id)
-for classical / tabular ML.
+ca_clean_full.py — Build the `full` view (strictly numeric/boolean +
+provider_id), valid ratings (1..5) only.
 
-    python clean_full.py \
-        --input facility_records_sample.csv \
-        --output full.csv \
-        --scaffold columns_scaffold.json \
-        --log parse_log_full.txt
+    python ca_clean_full.py
 """
 from __future__ import annotations
 
@@ -44,13 +40,13 @@ def main() -> None:
     df = pd.read_csv(args.input, dtype=str, low_memory=False)
     print(f"[{WHICH}] loaded {len(df)} rows, {df.shape[1]} columns from {args.input.name}")
 
-    df = drop_error_rows(df, log=log)        # user requirement, before everything
+    df = drop_error_rows(df, log=log)
     check_grain_uniqueness(df, "facility_number")
-    df = dollar_strip_df(df, log=log)        # TYPE 2 (harmless if no currency)
+    df = dollar_strip_df(df, log=log)
     df = engineer_features(df, WHICH, log=log)
     out = finalize(df, WHICH, scaffold, log=log)
 
-    # Contract check: every column except provider_id is numeric/boolean.
+    # Every column except provider_id must be numeric/boolean.
     non_numeric = [
         c for c in out.columns
         if c != ID_COL and not pd.api.types.is_numeric_dtype(out[c])

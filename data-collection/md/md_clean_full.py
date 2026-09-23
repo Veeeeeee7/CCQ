@@ -1,9 +1,8 @@
 """md_clean_full.py — Maryland EXCELS: strictly numeric/boolean cleaning,
-valid ratings only, for classical/tabular ML.
+valid ratings only.
 
-Same early steps and row filtering as md_clean_raw.py (row-aligned with it);
-multi-value fields become presence booleans and program_type becomes one-hot
-instead of staying free text.
+Row-aligned with md_clean_raw.py; multi-value fields become presence booleans
+and program_type becomes one-hot.
 
 Run:
     python md_clean_full.py
@@ -22,30 +21,37 @@ LOG_FILE = 'md_cleaning_log_full.txt'
 KEY = 'provider_id'
 TARGET = 'qr_rating'
 
-# Discovered-at-runtime column families retained by finalize(). program_type_*
-# only exists in full (raw keeps program_type as a single text column).
+# program_type_* only exists in full (raw keeps program_type as text).
 DYNAMIC_PREFIXES = ('achievement_', 'accreditation_', 'program_type_')
 
 RENAME = {
     'Program Type': 'program_type',
     'Scholarship Eligible': 'scholarship_eligible',
     'Enrollment Availability': 'enrollment_availability',
-    '6 weeks-17 mos': 'enrollment_age_6wk_17mo',
-    '18 mos-23 mos': 'enrollment_age_18_23mo',
-    '0 mos-23 mos': 'enrollment_age_0_23mo',
-    '2 years': 'enrollment_age_2yr',
-    '3 years': 'enrollment_age_3yr',
-    '4 years': 'enrollment_age_4yr',
-    '5 yrs preschool': 'enrollment_age_5yr_preschool',
-    '5 yrs-15 yrs': 'enrollment_age_5_15yr',
+    # Licensed age ranges and capacity: the program's licence scope. The
+    # '6 weeks-17 mos' ... '5 yrs-15 yrs' columns are openings per age band,
+    # not ages served, and are deliberately not renamed or kept.
+    'Licensed 6 weeks-17 mos': 'age_6wk_17mo',
+    'Licensed 18 mos-23 mos': 'age_18_23mo',
+    'Licensed 0 mos-23 mos': 'age_0_23mo',
+    'Licensed 2 years': 'age_2yr',
+    'Licensed 3 years': 'age_3yr',
+    'Licensed 4 years': 'age_4yr',
+    'Licensed 5 yrs preschool': 'age_5yr_preschool',
+    'Licensed 5 yrs-15 yrs': 'age_5_15yr',
+    'License Capacity': 'licensed_capacity',
 }
 
-ENROLLMENT_COLS = [
-    'enrollment_availability', 'enrollment_age_6wk_17mo',
-    'enrollment_age_18_23mo', 'enrollment_age_0_23mo', 'enrollment_age_2yr',
-    'enrollment_age_3yr', 'enrollment_age_4yr', 'enrollment_age_5yr_preschool',
-    'enrollment_age_5_15yr',
+# Present in every stage-1 file.
+YESNO_COLS = ['scholarship_eligible', 'enrollment_availability']
+
+# Present only once the licensed age/capacity columns have been merged.
+# Values are 'Yes'/'No', so a blank means unpublished or unmatched, not "no".
+AGE_COLS = [
+    'age_6wk_17mo', 'age_18_23mo', 'age_0_23mo', 'age_2yr', 'age_3yr',
+    'age_4yr', 'age_5yr_preschool', 'age_5_15yr',
 ]
+CAPACITY_COL = 'licensed_capacity'
 
 
 def create_log_file(path=LOG_FILE):
@@ -65,11 +71,28 @@ if __name__ == '__main__':
     df = pd.read_csv(INPUT, dtype=str, low_memory=False)  # preserve leading zeros (Program ID)
     log(f'[full] loaded {len(df)} rows from {INPUT}')
 
+    # Whether the program has a published rating yet; native column name.
     df['qr_rated'] = df['Quality Rating'].notna()
 
     df = df.rename(columns=RENAME)
-    for c in ['scholarship_eligible'] + ENROLLMENT_COLS:
+    for c in YESNO_COLS:
         df[c] = u.yesno_bool(df[c])
+
+    # Runs without the licensed age/capacity columns, but a half-merged file
+    # is a bug.
+    present = [c for c in AGE_COLS if c in df.columns]
+    if present and len(present) != len(AGE_COLS):
+        log(f'[full] WARNING: {len(present)} of {len(AGE_COLS)} licensed age '
+            f'columns present in {INPUT} -- it looks half-merged')
+    for c in present:
+        df[c] = u.yesno_bool(df[c])
+    if CAPACITY_COL in df.columns:
+        # Blank -> <NA>: no capacity published (every Public Prekindergarten
+        # row, plus a few centres).
+        df[CAPACITY_COL] = pd.to_numeric(df[CAPACITY_COL],
+                                         errors='coerce').astype('Int64')
+    log(f'[full] licensed age columns: {len(present)}/{len(AGE_COLS)}; '
+        f'licensed_capacity: {"yes" if CAPACITY_COL in df.columns else "no"}')
 
     df, pt_cols = u.build_categorical_onehot(df, 'program_type', 'program_type')
     df = df.drop(columns=['program_type'])
@@ -84,7 +107,6 @@ if __name__ == '__main__':
     df = u.finalize(df, COLUMNS_FILE, 'full', KEY, TARGET, DYNAMIC_PREFIXES,
                     na_as_level=False, valid_target_values=u.VALID_RATINGS)
 
-    # sanity: every non-id column must be numeric/boolean
     bad = [c for c in df.columns
            if c != 'provider_id' and not pd.api.types.is_numeric_dtype(df[c])
            and not pd.api.types.is_bool_dtype(df[c]) and df[c].dtype != 'boolean']

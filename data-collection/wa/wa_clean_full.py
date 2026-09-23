@@ -10,10 +10,8 @@ LOG_FILE = 'wa_cleaning_log_full.txt'
 KEY = 'provider_id'   # Salesforce `Id` is renamed to provider_id in finalize
 TARGET = 'qr_rating'  # Early_Achiever_Status_Internal__c -> qr_rating in finalize
 
-# Only these Early Achievers levels are valid scores. Level 3+ (the streamlined
-# Level 3 pathway) is collapsed to 3 by normalize_rating(); every non-rating
-# status (Not Enrolled, Withdrawn, Rating Expired, ...) becomes NaN and is
-# dropped by finalize(). There is no Level 1 — Level 1 is simply being licensed.
+# Level 3+ collapses to 3 and non-rating statuses become NaN (normalize_rating).
+# There is no Level 1 — Level 1 is simply being licensed.
 VALID_RATINGS = (2, 3, 4, 5)
 
 # Discovered-at-runtime boolean families retained by finalize().
@@ -48,9 +46,11 @@ if __name__ == "__main__":
     # Nested JSON -> numeric counts + severity features.
     df = u.json_counts(df)
 
-    # Structured text -> numeric/boolean scalars. Their text byproducts
-    # (ages_served, hours_<day>, contact_phone, location_city, ...) are NOT in the
-    # full scaffold, so finalize() drops them, leaving the full set numeric only.
+    # A blank *_count means the detail page was never seen: unknown, not zero.
+    df = u.mask_unknown_counts(df, log=log)
+
+    # Structured text -> numeric/boolean scalars. Their text byproducts are not
+    # in the full scaffold, so finalize() drops them.
     df = u.parse_ages_served(df, log=log)
     df = u.parse_contact_blob(df, log=log)
     df = u.parse_hours(df)
@@ -82,5 +82,8 @@ if __name__ == "__main__":
 
     df = u.finalize(df, COLUMNS_FILE, 'full', KEY, TARGET, DYNAMIC_PREFIXES,
                     valid_target_values=VALID_RATINGS)
+
+    # Uses post-rename names, so it has to run after finalize().
+    df = u.cast_int_columns(df, log=log)
     df.to_csv(OUTPUT, index=False)
     log(f'rows={len(df)} cols={len(df.columns)} -> {OUTPUT}')

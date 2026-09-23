@@ -1,29 +1,14 @@
 """
-co_clean_complete_raw.py — Build the `complete_raw` dataset: IDENTICAL
-text-preserving feature engineering to `raw`, but WITHOUT dropping rows whose
-qr_rating is invalid/unrated (the `complete` target policy).
+co_clean_complete_raw.py — Build the `complete_raw` dataset: same
+text-preserving feature engineering as `raw`, but rows whose qr_rating is
+invalid/unrated are kept. That includes provider types Colorado Shines never
+rates (School-Age Child Care Center, Resident Camp, Neighborhood Youth
+Organization). Row-aligned with complete_full, not with raw/full.
 
-The four outputs, on two axes (preprocessing style x target filtering):
-
-                       drop invalid ratings        keep invalid (complete)
-  full  (numeric)      co_cleaned_full.csv         co_clean_complete_full.csv
-  raw   (text)         co_cleaned_raw.csv          co_clean_complete_raw.csv
-
-complete_raw and complete_full share the same early steps and the same (no)
-target filtering, so they are ROW-ALIGNED with each other -- a single fold
-file covers both. They are NOT row-aligned with raw/full, which restrict to
-valid 1-5 ratings. This includes providers whose type is structurally never
-rated by Colorado Shines (School-Age Child Care Center, Resident Camp,
-Neighborhood Youth Organization) alongside any
-genuinely unrated/pending ratable-type providers.
-
-Uses a no-op logger rather than co_clean_raw.py's ParseLog: this runs the
-identical engineering over the identical input, so every parse warning it
-would produce is already captured in co_clean_raw.log by the sibling script --
-writing a second, near-duplicate log here would just be noise.
+Uses a no-op logger: every parse warning is already in co_clean_raw.log.
 
 Run:
-    python co_clean_complete_raw.py --input co_data/co_records.csv --output co_data/co_clean_complete_raw.csv
+    python co_clean_complete_raw.py
 """
 from __future__ import annotations
 
@@ -56,15 +41,13 @@ def main() -> None:
     print(f"[complete_raw] loading {args.input}")
     df = pd.read_csv(args.input, low_memory=False, dtype=str)  # preserve leading zeros
 
-    # --- shared early steps (identical to raw/full, keeps engineering aligned)
     df = U.null_out_enrichment_on_mismatch(df, log)
     df = df.drop(columns=["errors"], errors="ignore")
     df = U.strip_dollars(df)
     U.check_grain_unique(df, U.ID_COL, log)
     df = df.drop(columns=[c for c in U.NON_FEATURE_COLS if c in df.columns], errors="ignore")
 
-    # --- base: id, target, numeric passthroughs, preserved original text -----
-    # (identical to co_clean_raw.py)
+    # base: id, target, numeric passthroughs, original text
     base = pd.DataFrame(index=df.index)
     base[U.ID_COL] = df[U.ID_COL]
     base[U.TARGET_COL] = df[U.TARGET_COL]
@@ -87,9 +70,16 @@ def main() -> None:
         "license_number_on_site",
     ]
     for c in text_passthrough:
-        if c in df.columns:
+        if c not in df.columns:
+            continue
+        if c == "licensed_to_serve":
+            # One age SET, one spelling: canonicalise BEFORE finalize runs the
+            # privacy sweep, so word order does not split a set under k.
+            base[c] = U.build_licensed_to_serve(df[c], log)
+        else:
             base[c] = df[c]
 
+    # Yes/No and True/False text -> nullable boolean (in raw too)
     yes_no = ["head_start", "accepts_cccap_on_site", "accepting_new_children"]
     true_false = ["school_district_operated_program", "cccap_fa_status_d1",
                   "cccap_authorization_status", "upk_participation_2025_2026",
@@ -101,21 +91,19 @@ def main() -> None:
         if c in df.columns:
             base[c] = U.to_boolean(df[c], ("true",), ("false",))
 
-    # --- per-field builders (text-preserving -- identical to raw) ------------
     parts = [base, U.derive_date_features(df, log)]
     if "hours_of_operation" in df.columns:
         parts.append(U.derive_operating_hours(df["hours_of_operation"], log))
     if "special_needs" in df.columns:
         parts.append(U.build_multivalue(df["special_needs"], ";", "need", "raw"))
     if "languages_spoken" in df.columns:
-        parts.append(U.build_keyterm(df["languages_spoken"], U.LANGUAGE_KEYTERMS,
-                                     "language", "raw", log))
-    parts.append(U.build_licensing_history(df, "raw"))
+        # one column per recognised language; the k>=5 sweep folds rare ones
+        # into language_other
+        parts.append(U.build_language_features(df["languages_spoken"], "raw", log))
+    parts.append(U.build_licensing_history(df, "raw", log))
 
     engineered = pd.concat(parts, axis=1)
 
-    # which="raw" -> reuse raw's scaffold / discovered prefixes / text
-    # preservation; keep_invalid_target=True -> retain unrated/invalid rows.
     out = U.finalize(engineered, "raw", scaffold, log, keep_invalid_target=True)
 
     U.write_output(out, args.output)

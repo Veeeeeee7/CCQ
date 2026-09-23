@@ -2,66 +2,30 @@
 mt_capture.py — Montana MAQCS rendered-DOM + network capture helper
 ====================================================================
 
-Montana's licensing directory -- our source for the real license number
-(provider_id) that the STARS rating PDF lacks -- is the "Licensed Provider
-Search", which is embedded from a Salesforce Experience Cloud (Aura/LWC) site:
+The MAQCS "Licensed Provider Search" is a Salesforce Experience Cloud (Aura/LWC)
+site:
 
     https://mtdphhs.my.site.com/MAQCSChildCareLicensing/s/provider-search?language=en_US
 
-(The DPHHS wrapper page is dphhs.mt.gov/ecfsd/childcare/childcarelicensing/
-providersearch, whose instructions say: "Click the Search button to pull up a
-full list of providers" -- i.e. a blank search enumerates the whole directory,
-the MI/CCHIRP pattern.) A plain HTTP fetch of the my.site.com URL returns only
-the Lightning bootstrap shell; the real content is pushed in by JS after
-bootstrap and LWC renders into shadow DOM that string-serialized page.content()
-can't see. So this opens a real, human-driven browser and captures rendered
-HTML + a screenshot + the full session's XHR/fetch traffic whenever you press
-Enter.
-
-Why the network capture matters most here: if the search results come back as a
-clean JSON payload from an Aura/Apex endpoint (aura?r=...&other.ApexAction.
-execute or similar), we can hit that directly from mt_crawler.py -- far more
-robust than scraping shadow-DOM rows, and the playbook's preferred mechanism.
-MI's CCHIRP showed exactly this shape (a ~3MB ApexAction response holding the
-whole state); watch for the same here.
-
-What we need to learn from this recon (please note in your reply):
-  1. Does a blank "Search" return ALL licensed providers, or only a slice? Is
-     there a total count, and pagination?
-  2. Is there a "Download for export"/"Export" button (MI had one that dumped
-     the full result set)? What file type + columns does it produce?
-  3. What columns/fields are shown per provider -- especially the LICENSE /
-     REGISTRATION NUMBER, the legal + business name, city, and program type
-     (Center / Group / Family / etc.). We join these to the STARS seed on
-     name+city, so anything that disambiguates same-name programs helps.
-  4. The detail-page URL pattern -- is a provider addressable directly by its
-     license number, or only reachable via search?
-  5. Confirm whether the STARS/QRS star rating appears here at all (expected:
-     NO -- licensing only). If it somehow does, flag it: that would collapse
-     the two-source join into one source.
-  6. Any reCAPTCHA / bot-scoring (check the CSP header / network log for
-     google.com/recaptcha), so the crawler can budget for the persistent-
-     context + warm-up playbook.
+A plain HTTP fetch returns only the Lightning bootstrap shell; results are
+rendered by JS into shadow DOM that page.content() cannot see. So this opens a
+real, human-driven browser and captures rendered HTML + a screenshot + the full
+session's XHR/fetch traffic whenever you press Enter. The network log is what
+exposes the Apex JSON endpoint mt_crawler.py replays.
 
 Two modes:
 
   Interactive (default): a headful browser opens on MAQCS. Do a blank search,
-  note the total, open one provider, then (if present) click Export. Press
-  Enter here to capture whatever is frontmost. Repeat; type 'q' to quit.
+  open one provider, then press Enter here to capture whatever is frontmost.
+  Repeat; type 'q' to quit.
 
-  URL list: --urls U1 U2 ... visits + captures each (only useful once URL
-  patterns are known).
+  URL list: --urls U1 U2 ... visits + captures each.
 
 Usage:
   python mt_capture.py                       # interactive, headful, starts on MAQCS
   python mt_capture.py --out-dir mt_captures
   python mt_capture.py --channel chrome      # use real Chrome if reCAPTCHA is fussy
-  python mt_capture.py --urls <detail-url>   # later, once a URL pattern is known
-
-What to send back: mt_captures/manifest.csv, the capture_*.html files,
-network_log.json, the resp_*.txt bodies (especially any large JSON one), and
-the screenshots. Call out anything that looks like a license/provider ID and
-the export column headers.
+  python mt_capture.py --urls <detail-url>
 
 Deps: pip install playwright && playwright install chromium
 """
@@ -91,11 +55,9 @@ def wait_for_render(page, selector=None, settle_ms=1500, timeout_ms=30000,
                     poll_ms=400):
     """Wait for client-side rendering to settle.
 
-    Salesforce Lightning/Aura components mount asynchronously. Don't use
-    networkidle -- Experience Cloud keeps background polling/telemetry
-    connections open, so networkidle would hang. If `selector` is given, wait
-    for it (once a stable results-row node is known); otherwise poll
-    document.body.innerText length until it's unchanged for `settle_ms`.
+    Not networkidle: Experience Cloud keeps background polling connections
+    open, so it would hang. Waits for `selector` if given, otherwise until
+    document.body.innerText length is unchanged for `settle_ms`.
     """
     if selector:
         page.wait_for_selector(selector, timeout=timeout_ms)
@@ -123,9 +85,7 @@ def wait_for_render(page, selector=None, settle_ms=1500, timeout_ms=30000,
 
 
 def _mk_network_logger(network_log, out_dir, body_index):
-    """Record XHR/fetch traffic for the whole session. This is how we'd
-    discover a clean Aura/Apex JSON endpoint behind the search instead of
-    scraping rendered HTML -- far more robust if it exists."""
+    """Record XHR/fetch traffic (and response bodies) for the whole session."""
     def on_response(resp):
         try:
             req = resp.request
@@ -134,8 +94,7 @@ def _mk_network_logger(network_log, out_dir, body_index):
             entry = {'url': resp.url, 'method': req.method,
                      'status': resp.status,
                      'content_type': (resp.headers or {}).get('content-type', '')}
-            # Capture the request body too -- Aura POSTs the message/action
-            # payload we'd need to replay in the crawler.
+            # Aura POSTs the message/action payload a replay needs.
             try:
                 pd = req.post_data
                 if pd:
@@ -197,13 +156,12 @@ def run_interactive(start_url, out_dir, channel, wait_selector, settle_ms):
         browser = p.chromium.launch(**kwargs)
         context = browser.new_context(user_agent=UA,
                                       viewport={'width': 1400, 'height': 1000})
-        # Hide the automation flag (reCAPTCHA-v3 playbook, harmless otherwise).
+        # Hide the automation flag from bot scoring.
         context.add_init_script(
             "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
         page = context.new_page()
 
-        # One growing network log for the whole session, attached at the
-        # context level so a second tab is captured too.
+        # Attached at the context level so a second tab is captured too.
         network_log = []
         body_index = [0]
         context.on('response', _mk_network_logger(network_log, out_dir, body_index))

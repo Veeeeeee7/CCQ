@@ -1,19 +1,6 @@
-"""Fetch a Qwen checkpoint to a local directory.
+"""Download the Qwen3-4B checkpoint to models/qwen3_4b for the LLM classifiers.
 
-Downloads config, tokenizer and safetensors shards so the LLM experiments can
-load from disk rather than the Hub. GGUF files are skipped.
-
-The default repo is `Qwen/Qwen3-4B`, a dense checkpoint that loads with
-AutoModelForSequenceClassification under transformers>=4.51. MoE and multimodal
-Qwen variants are not supported by this pipeline.
-
-Run:
-    python download_qwen.py                              # -> models/qwen3_4b
-    python download_qwen.py --repo-id Qwen/Qwen3-8B
-    python download_qwen.py --dest /path/on/scratch      # set LLM_CLS_MODEL to match
-
-For faster downloads, pip install "huggingface_hub[hf_transfer]" and export
-HF_HUB_ENABLE_HF_TRANSFER=1. For a gated repo, pass --hf-token or set HF_TOKEN.
+    python download_qwen.py [--dest DIR]   # then export LLM_CLS_MODEL=DIR
 """
 from __future__ import annotations
 
@@ -21,8 +8,7 @@ import argparse
 import os
 from pathlib import Path
 
-# Destination matches where transfer_llm_cls looks when neither --model nor
-# $LLM_CLS_MODEL is set.
+# Same default location transfer_llm_cls loads from.
 DEFAULT_REPO_ID = "Qwen/Qwen3-4B"
 DEFAULT_DEST = str(Path(__file__).resolve().parent / "models" / "qwen3_4b")
 
@@ -35,13 +21,13 @@ def main() -> None:
     parser.add_argument("--dest", type=Path, default=Path(DEFAULT_DEST),
                         help=f"Local directory to download into (default: {DEFAULT_DEST}).")
     parser.add_argument("--revision", default=None,
-                        help="Optional git revision / tag / commit to pin.")
+                        help="Git revision, tag or commit to pin.")
     parser.add_argument("--hf-token", default=os.environ.get("HF_TOKEN"),
-                        help="HF token for gated repos (or set HF_TOKEN env var).")
+                        help="HF token for gated repos (default: $HF_TOKEN).")
     parser.add_argument("--ignore-patterns", nargs="+", default=["*.gguf"],
-                        help="Globs to skip (default skips GGUF).")
+                        help="Globs to skip.")
     parser.add_argument("--allow-patterns", nargs="+", default=None,
-                        help="If set, download ONLY files matching these globs.")
+                        help="If set, download only files matching these globs.")
     args = parser.parse_args()
 
     from huggingface_hub import snapshot_download
@@ -62,7 +48,6 @@ def main() -> None:
     )
 
     print(f"\nDone. Model files at: {path}")
-    # Check the files the loader needs are present.
     needed = ["config.json", "tokenizer_config.json"]
     safetensors = list(args.dest.glob("*.safetensors"))
     for f in needed:

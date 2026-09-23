@@ -3,18 +3,18 @@ California Child Care Crawler — mychildcareplan.org
 
 Given a list of facility numbers (CCL license numbers), this script searches
 each one on mychildcareplan.org, navigates to the provider details page, and
-scrapes all available information into a pandas DataFrame.
+scrapes all available information.
 
 Adapted from the Georgia DECAL crawler. Same overall structure:
-  - one row per provider
+  - one row per seeded licence
   - per-section try/except so a single broken field doesn't kill the row
-  - resumable via start_index
+  - resume-safe: facility numbers already in the output CSV are skipped
   - file-based logging
+
+    python ca_crawler.py
 """
 
-import numpy as np
 import pandas as pd
-import json
 import time
 import os
 import re
@@ -22,10 +22,8 @@ import random
 import traceback
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
+from ca_data_correction import LANGUAGE_COLUMN, sanitize_language
 
-# ---------------------------------------------------------------------------
-# logging
-# ---------------------------------------------------------------------------
 
 def create_log_file(path='ca_crawler_log.txt'):
     if os.path.exists(path):
@@ -40,23 +38,14 @@ def log(message, file='ca_crawler_log.txt'):
         print(message)
 
 
-# ---------------------------------------------------------------------------
-# constants
-# ---------------------------------------------------------------------------
-
 BASE_URL = 'https://mychildcareplan.org'
 HOME_URL = BASE_URL + '/'
 SEARCH_URL = BASE_URL + '/provider-search/'
 
 
-# ---------------------------------------------------------------------------
-# incremental save / resume
-# ---------------------------------------------------------------------------
-
 def all_columns():
-    """The full ordered list of columns the crawler may produce. Used to
-    keep the on-disk CSV consistent across appends, even when individual
-    sections fail and produce a subset of keys."""
+    """Every column the crawler may produce, in order, so appended rows stay
+    consistent even when a section fails."""
     cols = ['facility_number', 'provider_url']
     for fn in [empty_header, empty_contact, empty_hours, empty_license,
                empty_tags, empty_openings, empty_basics, empty_about,
@@ -67,10 +56,8 @@ def all_columns():
 
 
 def append_row(row, output_csv):
-    """Append a single row to the output CSV, creating the file (and parent
-    directory) if needed. Missing columns are filled with None. All string
-    values are normalized — newlines and runs of whitespace collapsed to
-    single spaces — so the resulting CSV stays one-row-per-line."""
+    """Append one row to the output CSV. Whitespace runs (incl. newlines) are
+    collapsed so the CSV stays one row per line."""
     cols = all_columns()
     full_row = {}
     for col in cols:
@@ -100,35 +87,14 @@ def load_completed(output_csv):
         return set()
 
 
-# ---------------------------------------------------------------------------
-# main crawler
-# ---------------------------------------------------------------------------
-
 def crawler(facility_numbers, output_csv='ca_data/ca_records.csv',
-            downloads_folder=None, headless=True, start_index=0,
+            headless=True, start_index=0,
             executable_path=None, slow_mo=0, delay_range=(5, 10)):
-    """
-    Args:
-        facility_numbers: list of license/facility numbers (str or int).
-        output_csv: path to a CSV that records scraped rows as they're
-                    captured. The file is created on first write, appended
-                    to thereafter, and used to resume — any facility number
-                    already present in this file is skipped on subsequent
-                    runs. Pass None to disable both behaviors.
-        downloads_folder: where to save anything downloadable. If None,
-                          downloads are skipped. (Most CA data is on-page,
-                          but the CDSS link can be followed for reports.)
-        headless:  run browser headlessly.
-        start_index:  resume from this index (legacy; the output_csv resume
-                      is preferred and works on top of this).
-        executable_path:  path to chrome binary (matches your GA script).
-        slow_mo: ms delay between Playwright actions (useful for debugging).
-        delay_range: (min, max) seconds to sleep between facilities. A
-                     uniform random value in this range is chosen for each
-                     iteration to avoid a predictable request cadence.
+    """Scrape each facility number; each row is written to output_csv (None
+    disables writing) as it is captured. delay_range is the (min, max) random
+    sleep between facilities, to avoid a predictable cadence.
 
-    Returns:
-        (DataFrame of rows scraped *this run*, last_index_processed)
+    Returns (DataFrame of rows scraped this run, last_index_processed).
     """
     rows = []
     completed = load_completed(output_csv)
@@ -146,7 +112,6 @@ def crawler(facility_numbers, output_csv='ca_data/ca_records.csv',
             launch_kwargs['executable_path'] = executable_path
         browser = p.chromium.launch(**launch_kwargs)
 
-        # User-agent / viewport reused for every per-facility context below
         ua = ('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
               'AppleWebKit/537.36 (KHTML, like Gecko) '
               'Chrome/120.0.0.0 Safari/537.36')
@@ -156,22 +121,20 @@ def crawler(facility_numbers, output_csv='ca_data/ca_records.csv',
             for index in range(start_index, len(facility_numbers)):
                 facility_number = str(facility_numbers[index]).strip()
 
-                # skip if already scraped in a previous run
                 if facility_number in completed:
                     continue
 
                 row = {'facility_number': facility_number}
                 errors = []
 
-                # Fresh incognito-isolated context for every facility — no
-                # cookies, cache, or storage carry over from the previous one.
+                # Fresh context per facility: no cookies, cache or storage
+                # carry over from the previous one.
                 context = browser.new_context(
                     viewport={'width': 1400, 'height': 900},
                     user_agent=ua,
                 )
                 page = context.new_page()
                 try:
-                    # cookie banner / first navigation
                     provider_url = find_provider_url(page, facility_number)
                     if provider_url is None:
                         log(f'[{index}] NOT FOUND: {facility_number}')
@@ -193,7 +156,13 @@ def crawler(facility_numbers, output_csv='ca_data/ca_records.csv',
                     time.sleep(1)
                     row['provider_url'] = page.url
 
-                    # extract each section independently
+                    # The search returns its first result, which is not always
+                    # the provider that was searched for.
+                    if not linkage_verified(page, facility_number):
+                        errors.append('linkage_unverified')
+                        log(f'  ! {facility_number} does not appear on the '
+                            f'landed page -- linkage unverified')
+
                     for section_name, fn, empty_fn in [
                         ('header',   crawl_header,   empty_header),
                         ('contact',  crawl_contact,  empty_contact),
@@ -244,8 +213,6 @@ def crawler(facility_numbers, output_csv='ca_data/ca_records.csv',
                     except Exception:
                         pass
 
-                # politeness delay between requests — random in delay_range
-                # to avoid a regular cadence. Skipped on the last facility.
                 if index < len(facility_numbers) - 1:
                     delay = random.uniform(*delay_range)
                     log(f'  ...sleeping {delay:.1f}s before next request')
@@ -266,10 +233,6 @@ def crawler(facility_numbers, output_csv='ca_data/ca_records.csv',
     return pd.DataFrame(rows), index
 
 
-# ---------------------------------------------------------------------------
-# search → provider URL
-# ---------------------------------------------------------------------------
-
 def find_provider_url(page, facility_number):
     """
     Use the site's header search bar to look up a facility number and return
@@ -278,7 +241,7 @@ def find_provider_url(page, facility_number):
     page.goto(HOME_URL, wait_until='domcontentloaded')
     time.sleep(1)
 
-    # accept cookie banner if it shows up — selector is best-effort
+    # cookie banner, if any — selector is best-effort
     try:
         accept = page.locator('button:has-text("Accept"), '
                               'button:has-text("Agree"), '
@@ -289,8 +252,7 @@ def find_provider_url(page, facility_number):
     except Exception:
         pass
 
-    # The header has a search input. We try multiple selector strategies
-    # because the site's markup may vary slightly across pages.
+    # Several selectors, because the header markup varies across pages.
     search_input = None
     candidates = [
         'input[placeholder*="Search" i]',
@@ -311,7 +273,7 @@ def find_provider_url(page, facility_number):
             continue
 
     if search_input is None:
-        # fallback: go straight to the provider-search page and try its query string
+        # fall back to the provider-search query string
         page.goto(SEARCH_URL + f'?search={facility_number}',
                   wait_until='domcontentloaded')
         time.sleep(2)
@@ -330,8 +292,6 @@ def find_provider_url(page, facility_number):
     if '/provider-details' in page.url:
         return page.url
 
-    # Look for a "View Details" link or a card link to the provider.
-    # Provider result cards have a link/button that goes to /provider-details/?...
     detail_link = None
     link_selectors = [
         'a[href*="/provider-details"]',
@@ -354,7 +314,6 @@ def find_provider_url(page, facility_number):
             detail_link = BASE_URL + detail_link
         return detail_link
 
-    # Last resort: try clicking the first result card and reading the URL
     try:
         card = page.locator('a:has-text("View Details")').first
         if card.count() > 0:
@@ -367,12 +326,6 @@ def find_provider_url(page, facility_number):
 
     return None
 
-
-# ---------------------------------------------------------------------------
-# scrapers — one per section
-# ---------------------------------------------------------------------------
-
-# ---- header (name, type, licensed/claimed status, photo) -------------------
 
 def empty_header():
     return {
@@ -387,18 +340,13 @@ def empty_header():
 def crawl_header(page):
     out = empty_header()
 
-    # name is the main h1 inside the details body
     h1 = page.locator('h1').first
     if h1.count() > 0:
         out['provider_name'] = _clean(_text(h1))
 
-    # provider_type is shown as a short label near the top. The site renders
-    # both the short label ("Small Family Child Care Home") AND a long
-    # tooltip explanation ("Small family child care homes may care for...")
-    # — we want only the short label. The reliable way is to scan all body
-    # text for the canonical type strings and take the *shortest* element
-    # that matches, since the short label sits in a small badge while the
-    # tooltip is in a long paragraph.
+    # The type appears both as a short badge ("Small Family Child Care Home")
+    # and inside a long tooltip paragraph, so match canonical type strings
+    # against the body text instead of reading one element.
     canonical_types = [
         'Small Family Child Care Home',
         'Large Family Child Care Home',
@@ -410,37 +358,30 @@ def crawl_header(page):
     ]
     type_pattern = '|'.join(re.escape(t) for t in canonical_types)
     body_text = _all_text(page.locator('body'))
-    # find the very first occurrence — the badge appears before the tooltip
     m = re.search(rf'\b({type_pattern})\b', body_text)
     if m:
-        # double-check by walking through canonical_types longest-first to
-        # avoid "Center" matching inside "Child Care Center"
+        # longest first, so "Center" does not win over "Child Care Center"
         for t in sorted(canonical_types, key=len, reverse=True):
             if t in body_text:
                 out['provider_type'] = t
                 break
 
-    # Licensed / Not Licensed — store as clean canonical strings
     if re.search(r'\bNot Licensed\b', body_text):
         out['licensed_status'] = 'Not Licensed'
     elif re.search(r'\bLicensed\b', body_text):
         out['licensed_status'] = 'Licensed'
 
-    # Claimed / Unclaimed
     if re.search(r'\bUnclaimed\b', body_text):
         out['claimed_status'] = 'Unclaimed'
     elif re.search(r'\bClaimed\b', body_text):
         out['claimed_status'] = 'Claimed'
 
-    # profile photo — an <img> sourced from partners.mychildcareplan.org
     img = page.locator('img[src*="partners.mychildcareplan.org/docs/ProviderPhotos"]').first
     if img.count() > 0:
         out['profile_photo_url'] = img.get_attribute('src')
 
     return out
 
-
-# ---- contact (phone, website) ---------------------------------------------
 
 def empty_contact():
     return {'phone': None, 'website_url': None}
@@ -449,9 +390,8 @@ def empty_contact():
 def crawl_contact(page):
     out = empty_contact()
 
-    # The site has a hotline tel: link at the top of every page (1-800-543-7793
-    # / 1-800-KIDS-793). We skip that and find the *provider's* phone, which
-    # appears further down the page.
+    # Every page carries the site's own hotline tel: link (1-800-KIDS-793);
+    # skip it to reach the provider's phone.
     HOTLINE_PATTERNS = [
         r'1?\s*\(?800\)?\s*543[-\s]?7793',
         r'1?\s*\(?800\)?\s*KIDS[-\s]?793',
@@ -466,7 +406,7 @@ def crawl_contact(page):
             out['phone'] = _clean(href)
             break
 
-    # external website link — skip social/internal/known-non-provider hosts
+    # first external link that is not a social/internal/known site host
     skip_hosts = ('mychildcareplan.org', 'addtoany.com', 'facebook.com',
                   'twitter.com', 'instagram.com', 'youtube.com',
                   'rrnetwork.org', 'ccld.dss.ca.gov', 'leginfo.legislature.ca.gov',
@@ -482,17 +422,14 @@ def crawl_contact(page):
     return out
 
 
-# ---- business hours --------------------------------------------------------
-
 def empty_hours():
     return {'business_hours': None}
 
 
 def crawl_hours(page):
     out = empty_hours()
-    # The Business Hours panel is collapsed by default — its DOM is present
-    # but not in the visible accessibility tree, so we use textContent
-    # (via _all_text) instead of innerText.
+    # The Business Hours panel is collapsed by default, so read textContent
+    # (_all_text) rather than innerText.
     block = page.locator('text=/Business Hours/i').first
     if block.count() == 0:
         return out
@@ -506,7 +443,47 @@ def crawl_hours(page):
     return out
 
 
-# ---- license number + reports link ----------------------------------------
+# The site prints every licence a profile holds after a single "License Number"
+# label, comma separated ("License Number: 304270387, 304270386"). Continuation
+# items must start with a digit so the run stops at ordinary prose after a comma.
+LICENSE_NUMBER_RE = re.compile(
+    r'License\s*Number\s*[:\s]\s*([A-Z0-9-]+(?:\s*,\s*[0-9][A-Z0-9-]*)*)', re.I)
+_LICENCE_SPLIT_RE = re.compile(r'\s*,\s*')
+
+
+def licences_on_page(body_text):
+    """Every licence number printed on the page, in order, deduplicated."""
+    seen, found = set(), []
+    for m in LICENSE_NUMBER_RE.finditer(body_text or ''):
+        for part in _LICENCE_SPLIT_RE.split(m.group(1)):
+            value = _clean(part)
+            if value and value not in seen:
+                seen.add(value)
+                found.append(value)
+    return found
+
+
+def _norm_licence(value):
+    """Normalize a licence number for comparison; leading zeros and
+    punctuation are cosmetic on the site."""
+    return re.sub(r'[^0-9A-Za-z]', '', str(value or '').strip()).lstrip('0').upper()
+
+
+def linkage_verified(page, facility_number):
+    """True if the searched facility number is one of the licences on the page.
+
+    A profile can hold several licences, so the test is membership in the full
+    list rather than equality with the first one. A page that prints no
+    licence cannot be checked and passes: unverifiable is not wrong.
+    """
+    wanted = _norm_licence(facility_number)
+    if not wanted:
+        return True
+    body_text = _all_text(page.locator('body'))
+    found = {_norm_licence(v) for v in licences_on_page(body_text)}
+    found.discard('')
+    return not found or wanted in found
+
 
 def empty_license():
     return {'license_number': None, 'licensing_reports_url': None}
@@ -515,9 +492,10 @@ def empty_license():
 def crawl_license(page):
     out = empty_license()
     body_text = _all_text(page.locator('body'))
-    m = re.search(r'License\s*Number\s*[:\s]\s*([A-Z0-9-]+)', body_text, re.I)
-    if m:
-        out['license_number'] = _clean(m.group(1))
+    # license_number keeps only the first licence the page prints.
+    licences = licences_on_page(body_text)
+    if licences:
+        out['license_number'] = licences[0]
 
     reports = page.locator('a[href*="ccld.dss.ca.gov/carefacilitysearch"]').first
     if reports.count() > 0:
@@ -525,44 +503,50 @@ def crawl_license(page):
     return out
 
 
-# ---- tags (program types) -------------------------------------------------
-
 def empty_tags():
     return {'tags_count': None, 'tags': None}
 
 
 def crawl_tags(page):
+    """Read the tag list.
+
+    Names come from the <li class="program-tags__tag"> items, which exist for
+    every tag; the "Learn More" links are a fallback, as not every tag has one.
+    """
     out = empty_tags()
-    # Tags section has a heading like "View Tags (N)" and a list of tags
-    # below. Each tag has a "Learn More" link of the form
-    # /resources/?search=<Tag+Name>. We extract tags from those hrefs.
     heading = page.locator('text=/View Tags\\s*\\(\\d+\\)/').first
     if heading.count() > 0:
         m = re.search(r'\((\d+)\)', _all_text(heading))
         if m:
             out['tags_count'] = int(m.group(1))
 
-    tag_links = page.locator('a[href*="resources/?search="]')
     seen, ordered = set(), []
-    from urllib.parse import unquote
-    for i in range(tag_links.count()):
-        href = tag_links.nth(i).get_attribute('href') or ''
-        m = re.search(r'search=([^&]+)', href)
-        if not m:
-            continue
-        tag = unquote(m.group(1).replace('+', ' '))
-        tag = _clean(tag)
-        if tag and tag not in seen:
-            seen.add(tag)
-            ordered.append(tag)
+
+    def add(name):
+        name = _clean(name)
+        if name and name not in seen:
+            seen.add(name)
+            ordered.append(name)
+
+    items = page.locator('li.program-tags__tag')
+    for i in range(items.count()):
+        add(_all_text(items.nth(i)))
+
+    if not ordered:
+        tag_links = page.locator('a[href*="resources/?search="]')
+        from urllib.parse import unquote
+        for i in range(tag_links.count()):
+            href = tag_links.nth(i).get_attribute('href') or ''
+            m = re.search(r'search=([^&]+)', href)
+            if m:
+                add(unquote(m.group(1).replace('+', ' ')))
+
     if ordered:
         out['tags'] = '|'.join(ordered)
         if out['tags_count'] is None:
             out['tags_count'] = len(ordered)
     return out
 
-
-# ---- openings -------------------------------------------------------------
 
 def empty_openings():
     return {
@@ -572,70 +556,77 @@ def empty_openings():
     }
 
 
+# The Openings heading comes in two forms. mychildcareplan.org renders
+#     Openings (last updated MM/DD/YYYY)
+# only while the provider's confirmation is recent and a bare
+#     Openings
+# otherwise -- the same block underneath, with the same "Capacity: N" lines.
+OPENINGS_HEADING_RE = r'^\s*Openings\s*(\(last updated[^)]*\))?\s*$'
+OPENINGS_PREFIX_RE = re.compile(r'^\s*Openings\s*(?:\(last updated[^)]*\))?\s*',
+                                re.I)
+# 'Contact ' is deliberately NOT a stop marker: an age group's availability
+# line can be "Contact provider for details", followed by its "Capacity: N".
+OPENINGS_STOP_MARKERS = ('The Basics', 'About ', 'Next Steps', 'Disclaimer',
+                         'Tags')
+CAPACITY_RE = re.compile(r'Capacity\s*:\s*([0-9]+)', re.I)
+CAPACITY_STRIP_RE = re.compile(r'\s*Capacity\s*:\s*[0-9]+', re.I)
+
+
 def crawl_openings(page):
     """Parse the Openings section.
 
-    The section has the form:
-        Openings (last updated MM/DD/YYYY)
-        <group name>           e.g. "Preschool (2 to 5 years)"
-        <status>               "No Openings" or a list of openings
-        Capacity: <N>
-        [next section: The Basics ...]
+        Openings [(last updated MM/DD/YYYY)]
+        <group name>   <status>   Capacity: <N>     (repeated per age group)
 
-    We need to bound the scope so we don't accidentally slurp The Basics.
-    Strategy: get the heading's containing section, then crop the resulting
-    text at the first marker of the next section.
+    openings_capacity is the SUM across age groups; the "Capacity:" tokens are
+    stripped from openings_status. The body is read from
+    <div class="provider-openings">, a sibling of the heading, with a
+    heading-ancestor text crop as the fallback.
     """
     out = empty_openings()
-    heading = page.locator('text=/Openings\\s*\\(last updated/i').first
-    if heading.count() == 0:
-        return out
 
-    heading_text = _all_text(heading)
-    m = re.search(r'last updated\s+([0-9/.-]+)', heading_text, re.I)
-    if m:
-        out['openings_last_updated'] = _clean(m.group(1).rstrip(') '))
+    heading = page.locator(f'text=/{OPENINGS_HEADING_RE}/i').first
+    has_heading = heading.count() > 0
+    if has_heading:
+        m = re.search(r'last updated\s+([0-9/.-]+)', _all_text(heading), re.I)
+        if m:
+            out['openings_last_updated'] = _clean(m.group(1).rstrip(') '))
 
-    # walk up to the openings section/container
-    container = heading.locator(
-        'xpath=ancestor::*[self::section or self::div or self::article][1]'
-    )
-    if container.count() == 0:
-        return out
-    raw = _all_text(container)
-
-    # Crop everything from "Openings (..." onwards (drop the header above)
-    if 'Openings (' in raw:
-        raw = 'Openings (' + raw.split('Openings (', 1)[1]
-
-    # Stop at the next section heading
-    for stop_marker in ['The Basics', 'About ', 'Next Steps',
-                        'Disclaimer', 'Contact ', 'Tags']:
-        idx = raw.find(stop_marker)
+    block = page.locator('div.provider-openings').first
+    if block.count() > 0:
+        raw = _clean(_all_text(block)) or ''
+    elif has_heading:
+        container = heading.locator(
+            'xpath=ancestor::*[self::section or self::div or self::article][1]'
+        )
+        if container.count() == 0:
+            return out
+        raw = _clean(_all_text(container)) or ''
+        head = _clean(_all_text(heading)) or ''
+        idx = raw.find(head) if head else -1
         if idx > 0:
-            raw = raw[:idx]
+            raw = raw[idx:]
+        for stop_marker in OPENINGS_STOP_MARKERS:
+            idx = raw.find(stop_marker)
+            if idx > 0:
+                raw = raw[:idx]
+        raw = OPENINGS_PREFIX_RE.sub('', raw, count=1)
+    else:
+        return out
 
-    # Strip the "Openings (last updated MM/DD/YYYY)" prefix itself
-    raw = re.sub(r'^Openings\s*\(last updated[^)]*\)\s*',
-                 '', raw, count=1, flags=re.I)
+    caps = CAPACITY_RE.findall(raw)
+    if caps:
+        out['openings_capacity'] = str(sum(int(n) for n in caps))
+        raw = CAPACITY_STRIP_RE.sub('', raw)
 
-    # Capacity: pull it out then strip from the remaining status text
-    cap_match = re.search(r'Capacity\s*:\s*([0-9]+)', raw, re.I)
-    if cap_match:
-        out['openings_capacity'] = _clean(cap_match.group(1))
-        raw = re.sub(r'Capacity\s*:\s*[0-9]+', '', raw, count=1, flags=re.I)
-
-    # what's left is the status (clean and truncate)
     status = _clean(raw)
     if status:
         out['openings_status'] = status[:500]
     return out
 
 
-# ---- "The Basics" block ---------------------------------------------------
-
-# These are the labels shown in the basics block. We normalize each label
-# into a column name. New labels will still get captured (see below).
+# Labels in The Basics block; each becomes basics_<label>. Unlisted labels are
+# still captured.
 BASICS_LABELS = [
     'Language', 'Schedule', 'Transportation', 'Meals',
     'Special Needs Experience', 'Accreditation', 'Subsidies Accepted',
@@ -672,7 +663,6 @@ def crawl_basics(page):
     items = page.locator('ul.provider-attributes__list > li.provider-attributes__item')
     n = items.count()
     if n == 0:
-        # fallback to a more permissive selector in case markup varies
         items = page.locator('li.provider-attributes__item')
         n = items.count()
     if n == 0:
@@ -681,8 +671,7 @@ def crawl_basics(page):
     for i in range(n):
         item = items.nth(i)
 
-        # The label is the span that has no class (icons and tooltips have
-        # classes). Walk through the spans and pick the unclassed one.
+        # The label is the span with no class (icons and tooltips have one).
         label = None
         spans = item.locator('span')
         for j in range(spans.count()):
@@ -693,8 +682,7 @@ def crawl_basics(page):
                 if label:
                     break
 
-        # Fallback: derive label from the full item text by stripping the
-        # value (whatever's in <strong>) and the tooltip text.
+        # Fallback: item text minus the <strong> value and the tooltip.
         if not label:
             full = _all_text(item)
             strong_text = ''
@@ -702,29 +690,27 @@ def crawl_basics(page):
             if strong.count() > 0:
                 strong_text = _all_text(strong)
             label_guess = full.replace(strong_text, '', 1)
-            # cut tooltip text (starts with "Quality Counts California" for QCC)
             label_guess = re.split(r'Quality Counts California', label_guess)[0]
             label = _clean(label_guess)
 
         if not label:
             continue
-        # strip trailing colon
         label = label.rstrip(':').strip()
 
-        # The value is the <strong>
         strong = item.locator('strong').first
         if strong.count() == 0:
             continue
         value = _clean(_all_text(strong))
-        # Treat the literal placeholder "-" as an empty value (CDSS uses
-        # a hyphen to mean "no data"). Keep it as the literal '-' so it's
-        # distinguishable from a true None / "not scraped".
-        out[f'basics_{_normalize_label(label)}'] = value
+        key = f'basics_{_normalize_label(label)}'
+        if key == LANGUAGE_COLUMN:
+            # Some pages serve option codes ('00, 01') or leak a component
+            # label ('..., 2.Labels- English'); neither is decodable from the
+            # page, so those tokens are dropped. See sanitize_language().
+            value = sanitize_language(value)
+        out[key] = value
 
     return out
 
-
-# ---- about + age range ----------------------------------------------------
 
 def empty_about():
     return {'age_range': None, 'about_text': None}
@@ -733,15 +719,12 @@ def empty_about():
 def crawl_about(page):
     out = empty_about()
 
-    # Age range shows up near the top as "Ages X years - Y years" or
-    # "Ages X months - Y years"
     body_text = _all_text(page.locator('body'))
     m = re.search(r'Ages\s+([0-9]+\s*(?:months?|years?)\s*-\s*'
                   r'[0-9]+\s*(?:months?|years?))', body_text, re.I)
     if m:
         out['age_range'] = _clean(m.group(1))
 
-    # About section: heading "About {provider_name}"
     about_heading = page.locator('h2:has-text("About"), h3:has-text("About")').first
     if about_heading.count() > 0:
         container = about_heading.locator(
@@ -749,9 +732,7 @@ def crawl_about(page):
         )
         if container.count() > 0:
             txt = _all_text(container)
-            # strip the heading itself
             txt = re.sub(r'^About[^\n]*\n', '', txt).strip()
-            # cut off at next section
             for cutoff in ['Next Steps', 'Disclaimer', 'Parental Rights',
                            'Share', 'Print', 'Favorite']:
                 if cutoff in txt:
@@ -762,8 +743,7 @@ def crawl_about(page):
     return out
 
 
-# ---- address (often hidden for FCCH; centers usually have it) -------------
-
+# The address is often hidden for family child care homes.
 def empty_address():
     return {'address': None, 'google_maps_url': None}
 
@@ -775,7 +755,6 @@ def crawl_address(page):
         href = gmap.get_attribute('href')
         if href:
             out['google_maps_url'] = _clean(href)
-            # extract embedded address from the maps query string if present
             from urllib.parse import unquote_plus
             m = re.search(r'q=([^&]+)', href)
             if m:
@@ -786,10 +765,6 @@ def crawl_address(page):
                 out['address'] = _clean(unquote_plus(place))
     return out
 
-
-# ---------------------------------------------------------------------------
-# helpers
-# ---------------------------------------------------------------------------
 
 def _text(locator):
     """Safely get inner text from a locator."""
@@ -803,9 +778,8 @@ def _text(locator):
 
 
 def _all_text(locator):
-    """Get text including hidden/collapsed content (uses textContent rather
-    than innerText). Used for tooltips and accordions that may not be in
-    the visible accessibility tree."""
+    """textContent rather than innerText, so hidden tooltips and collapsed
+    accordions are included."""
     try:
         return (locator.text_content(timeout=2000) or '').strip()
     except Exception:
@@ -813,8 +787,7 @@ def _all_text(locator):
 
 
 def _clean(s):
-    """Normalize whitespace: collapse all runs of whitespace (including
-    newlines, tabs) into single spaces, strip ends. Returns None for empty."""
+    """Collapse whitespace runs to single spaces and strip; None if empty."""
     if s is None:
         return None
     s = re.sub(r'\s+', ' ', str(s)).strip()
@@ -830,15 +803,9 @@ def create_empty_row():
     return row
 
 
-# ---------------------------------------------------------------------------
-# entry point
-# ---------------------------------------------------------------------------
-
 if __name__ == '__main__':
     create_log_file()
 
-    # ----- input -----------------------------------------------------------
-    # CSV with a column of facility numbers. Adjust the column name as needed.
     INPUT_CSV = 'ca_data/ca_seed.csv'
     FACILITY_COL = 'facility_number'
     OUTPUT_CSV = 'ca_data/ca_records.csv'
@@ -846,17 +813,12 @@ if __name__ == '__main__':
     df_in = pd.read_csv(INPUT_CSV, dtype=str)
     facility_numbers = df_in[FACILITY_COL].dropna().astype(str).tolist()
 
-    # ----- run -------------------------------------------------------------
-    # Saves each row to OUTPUT_CSV as it's scraped. Re-running the script
-    # picks up where it left off — any facility number already present in
-    # OUTPUT_CSV is skipped. To retry failures, delete the relevant rows
-    # (e.g. those with errors='not_found' or errors='exception') from the
-    # CSV before re-running.
+    # Re-running resumes. To retry failures, delete their rows
+    # (errors='not_found' / 'exception') from OUTPUT_CSV first.
     crawled_df, last_index = crawler(
         facility_numbers,
         output_csv=OUTPUT_CSV,
         headless=True,
-        # executable_path='chrome-headless-shell-mac-arm64/chrome-headless-shell',
     )
     log(f'Done. Scraped {len(crawled_df)} new rows this run. '
         f'Last index processed: {last_index}.')
