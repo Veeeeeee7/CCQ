@@ -1,7 +1,11 @@
 """ModernBERT within-state (5-fold CV on the serialized text), plus the shared
 HuggingFace Trainer plumbing used by the cross-state text and LLM methods.
+`bert_textualized_full` trains a softmax head (MBERT) and `bert_corn_textualized_full`
+the CORN ordinal head of `transfer_plm_corn` (MBERT-CORN).
 
     python llm.py --input data/wi_records_cleaned_raw.csv --remap-state WI --rating-scale 5star
+    python llm.py --models bert_corn_textualized_full --input data/wi_records_cleaned_raw.csv \\
+        --remap-state WI --rating-scale 5star
 """
 from __future__ import annotations
 
@@ -222,8 +226,12 @@ def _train_one_fold(
     models_dir: Path,
     score_texts: "list[str] | None" = None,
     score_labels: "np.ndarray | None" = None,
+    head: str = "softmax",
 ) -> dict:
-    """Fine-tune ModernBERT, early-stop on `val_*`, return metrics on `score_*`."""
+    """Fine-tune ModernBERT, early-stop on `val_*`, return metrics on `score_*`.
+
+    `head` is "softmax" (K logits) or "corn" (K-1 CORN logits); both use class weights.
+    """
     import shutil
 
     from transformers import (
@@ -252,8 +260,10 @@ def _train_one_fold(
     cw[present.astype(int)] = cw_present
     class_weights = torch.as_tensor(cw, dtype=torch.float32)
 
+    if head not in ("softmax", "corn"):
+        raise ValueError(f"unknown head {head!r}")
     model = AutoModelForSequenceClassification.from_pretrained(
-        MODEL_NAME, num_labels=n_classes,
+        MODEL_NAME, num_labels=n_classes if head == "softmax" else n_classes - 1,
     )
 
     out_dir = models_dir / f"fold_{fold_idx}"
@@ -283,20 +293,28 @@ def _train_one_fold(
     def _hf_compute_metrics(eval_pred):
         logits, labels = eval_pred
         logits = np.asarray(logits)
-        shifted = logits - logits.max(axis=-1, keepdims=True)
-        exp = np.exp(shifted)
-        y_proba = exp / exp.sum(axis=-1, keepdims=True)
-        pred_idx = np.argmax(logits, axis=-1)
-        y_pred = np.array([idx_to_label[i] for i in pred_idx])
-        y_true = np.array([idx_to_label[i] for i in labels])
+        y_true = np.array([idx_to_label[int(i)] for i in labels])
+        if head == "corn":
+            from transfer_plm_corn import _corn_decode
+            y_pred, y_proba = _corn_decode(logits, idx_to_label, n_classes)
+        else:
+            shifted = logits - logits.max(axis=-1, keepdims=True)
+            exp = np.exp(shifted)
+            y_proba = exp / exp.sum(axis=-1, keepdims=True)
+            pred_idx = np.argmax(logits, axis=-1)
+            y_pred = np.array([idx_to_label[i] for i in pred_idx])
         return compute_metrics(
             y_true, y_pred, y_proba=y_proba, labels=classes_sorted,
         )
 
-    WeightedTrainer = _make_weighted_trainer_class(class_weights)
+    if head == "corn":
+        from transfer_plm_corn import _make_corn_trainer_class
+        TrainerCls = _make_corn_trainer_class(n_classes, class_weights=class_weights)
+    else:
+        TrainerCls = _make_weighted_trainer_class(class_weights)
     keeper = make_best_model_keeper(metric="eval_qwk", greater_is_better=True,
                                     patience=2)
-    trainer = WeightedTrainer(
+    trainer = TrainerCls(
         model=model,
         args=args,
         train_dataset=train_ds,
@@ -343,6 +361,7 @@ def _run_plm_cv(
     texts: pd.Series,
     label: str,
     models_dir: Path,
+    head: str = "softmax",
 ) -> list[dict]:
     """5-fold CV over the shared folds; `texts` holds one string per row of `df`."""
     from transformers import AutoTokenizer
@@ -353,7 +372,7 @@ def _run_plm_cv(
     idx_to_label = {i: c for c, i in label_to_idx.items()}
 
     print(f"\n{'=' * 60}")
-    print(f"Training {label.upper()} ({n_classes} classes, device={DEVICE})")
+    print(f"Training {label.upper()} ({n_classes} classes, head={head}, device={DEVICE})")
     print(f"  model={MODEL_NAME}, max_len={MAX_LEN}, lr={LR}, "
           f"batch={BATCH_SIZE}, epochs={EPOCHS}")
     print(f"{'=' * 60}")
@@ -390,6 +409,7 @@ def _run_plm_cv(
             tokenizer, n_classes, idx_to_label, classes_sorted,
             models_dir / label,
             score_texts=val_texts, score_labels=val_labels,
+            head=head,
         )
         fold_metrics.append(m)
         print(
@@ -426,8 +446,20 @@ def run_textualized_full(
                        f"bert_textualized_full_{compliance_mode}", models_dir)
 
 
+def run_corn_textualized_full(
+    df: pd.DataFrame, folds: list[dict], models_dir: Path,
+    compliance_mode: str = "verbose",
+) -> list[dict]:
+    print(f"  textualizing rows (compliance_mode={compliance_mode!r})...")
+    texts = serialize_dataframe(df, compliance_mode=compliance_mode)
+    return _run_plm_cv(df, folds, texts,
+                       f"bert_corn_textualized_full_{compliance_mode}", models_dir,
+                       head="corn")
+
+
 MODEL_RUNNERS: dict[str, Callable] = {
     "bert_textualized_full": run_textualized_full,
+    "bert_corn_textualized_full": run_corn_textualized_full,
 }
 
 

@@ -3,7 +3,7 @@ from shuffled shadow columns.
 
 A regressor (not the K-way classifier) gives one SHAP matrix in rating points
 instead of one per class. Feature direction is `dir_corr`, not `mean_shap`.
-`--grid-only` rebuilds the 3x4 figure from existing per-state CSVs.
+`--grid-only` rebuilds the grid figure from existing per-state CSVs.
 
     python shap_xgb.py --input data/nc_records_cleaned_full.csv \\
         --folds fold_indices/nc_native_folds.json --remap-state NC --rating-scale 5star
@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
 import time
 from pathlib import Path
 
@@ -39,6 +40,40 @@ SHADOW_PREFIX = "shadow__"
 
 # Panel order of the grid figure.
 GRID_STATES = ["ca", "ga", "nc", "wi", "co", "ky", "md", "mt", "ne", "ok", "sc", "wa"]
+# Printed point sizes of the paper grid (feature names, x ticks, state titles) in the
+# LaTeX font and in matplotlib's default font.
+FS_LATEX, FS_DEFAULT = (6.8, 6.2, 8.0), (6.0, 5.5, 7.5)
+
+
+def _tint(hex_color: str, frac: float = 0.5) -> str:
+    """Mix `hex_color` with white, as xcolor's `color!50` does."""
+    rgb = [int(hex_color.lstrip("#")[i:i + 2], 16) for i in (0, 2, 4)]
+    return "#" + "".join(f"{round(c * frac + 255 * (1 - frac)):02X}" for c in rgb)
+
+
+# Bar colors: red where a feature lowers the predicted rating, green where it raises it.
+NEG_EDGE, POS_EDGE = "#D73027", "#1A7F45"
+NEG_FILL, POS_FILL = _tint(NEG_EDGE), _tint(POS_EDGE)
+
+
+# With LaTeX installed, the paper grid is typeset in the paper's font (Linux Libertine),
+# which needs the libertine and newtx packages; otherwise matplotlib's default font is used.
+LATEX_PREAMBLE = r"\usepackage[T1]{fontenc}\usepackage{libertine}\usepackage[libertine]{newtxmath}"
+_TEX_ESCAPES = {"\\": r"\textbackslash{}", "_": r"\_", "&": r"\&", "%": r"\%", "$": r"\$",
+                "#": r"\#", "{": r"\{", "}": r"\}", "~": r"\textasciitilde{}",
+                "^": r"\textasciicircum{}", "\u2026": r"\ldots{}"}
+
+
+def _tex(text) -> str:
+    """Escape a label for LaTeX."""
+    return "".join(_TEX_ESCAPES.get(c, c) for c in str(text))
+
+
+def _direction_colors(dir_corr):
+    """(fill, edge) lists for bars; direction comes from dir_corr, not mean_shap."""
+    pos = [v >= 0 for v in dir_corr]
+    return ([POS_FILL if p else NEG_FILL for p in pos],
+            [POS_EDGE if p else NEG_EDGE for p in pos])
 
 
 def n_jobs_from_env(default: int = 4) -> int:
@@ -273,8 +308,9 @@ def plot_state(summary, sv, X, feature_names, state, top_k, figs_dir):
 
     fig, ax = plt.subplots(figsize=(7, 0.38 * len(top) + 1.2))
     # Colour by dir_corr; mean_shap carries the weighting offset.
-    colors = ["#1D9E75" if v >= 0 else "#D85A30" for v in top["dir_corr"]]
-    ax.barh(top["feature"], top["mean_abs_shap"], color=colors)
+    fill, edge = _direction_colors(top["dir_corr"])
+    ax.barh(top["feature"], top["mean_abs_shap"], color=fill, edgecolor=edge,
+            linewidth=0.6)
     if np.isfinite(floor):
         ax.axvline(floor, color="#888780", linestyle="--", linewidth=1,
                    label="noise floor")
@@ -313,68 +349,112 @@ def _shorten(name: str, maxlen: int = 26) -> str:
     return name[: maxlen - keep_tail - 1] + "…" + name[-keep_tail:]
 
 
+def _place_grid(fig, axes, *, left, right, top, bottom, col_gap, row_gap,
+                label_pad):
+    """Place the axes so each column's left gutter fits its widest y tick label.
+
+    Sizes are in inches; `row_gap` holds one row's x tick labels and the next title.
+    """
+    fig.canvas.draw()
+    renderer = fig.canvas.get_renderer()
+    fig_w, fig_h = fig.get_size_inches()
+    nrows, ncols = axes.shape
+    gutters = []
+    for c in range(ncols):
+        widest = 0.0
+        for ax in axes[:, c]:
+            for t in ax.get_yticklabels():
+                if t.get_visible() and t.get_text():
+                    widest = max(widest, t.get_window_extent(renderer).width / fig.dpi)
+        gutters.append(widest + label_pad)
+    panel_w = (fig_w - left - right - sum(gutters) - col_gap * (ncols - 1)) / ncols
+    panel_h = (fig_h - top - bottom - row_gap * (nrows - 1)) / nrows
+    if panel_w < 0.4 or panel_h < 0.4:
+        raise ValueError(f"grid panels too small ({panel_w:.2f} x {panel_h:.2f} in); "
+                         "shorten the labels or enlarge the figure")
+    x = left
+    for c in range(ncols):
+        x += gutters[c]
+        for r in range(nrows):
+            y = fig_h - top - (r + 1) * panel_h - r * row_gap
+            axes[r, c].set_position([x / fig_w, y / fig_h, panel_w / fig_w, panel_h / fig_h])
+        x += panel_w + col_gap
+
+
 def plot_grid(results_dir: Path, top_k: int = 10, paper: bool = True):
-    """3x4 grid of per-state top-k panels; `paper` sizes it for a two-column page."""
+    """4x3 grid (rows x columns) of per-state top-k panels; `paper` sizes it for the page."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
+    usetex = paper and shutil.which("latex") is not None
     if paper:
-        figsize, fs_lab, fs_tick, fs_title, fs_sup, maxlen = \
-            (7.16, 6.6), 4.6, 4.4, 6.5, None, 26
-        margins = dict(left=0.165, right=0.985, top=0.975, bottom=0.045,
-                       wspace=1.05, hspace=0.30)
+        # The paper's text width, so the figure prints at 100% and the font sizes as set.
+        figsize, fs_sup, maxlen = (6.26, 6.8), None, 24
+        fs_lab, fs_tick, fs_title = FS_LATEX if usetex else FS_DEFAULT
+        margins = dict(left=0.02, right=0.08, top=0.16, bottom=0.20,
+                       col_gap=0.14, row_gap=0.32, label_pad=0.05)
     else:
         figsize, fs_lab, fs_tick, fs_title, fs_sup, maxlen = \
             (20, 12), 7, 7, 11, 13, 60
-        margins = dict(left=0.07, right=0.98, top=0.92, bottom=0.05,
-                       wspace=0.55, hspace=0.30)
+        margins = dict(left=0.10, right=0.20, top=0.70, bottom=0.30,
+                       col_gap=0.25, row_gap=0.50, label_pad=0.08)
 
-    results_dir = Path(results_dir)
-    fig, axes = plt.subplots(3, 4, figsize=figsize)
-    n_found = 0
-    for ax, st in zip(axes.ravel(), GRID_STATES):
-        path = results_dir / f"shap_xgb_{st}_results.csv"
-        if not path.exists():
-            # Blank but keep the axes so the grid geometry stays fixed.
-            ax.set_title(f"{st.upper()} — missing", fontsize=fs_title, color="#888780")
-            ax.set_xticks([])
-            ax.set_yticks([])
-            for spine in ax.spines.values():
-                spine.set_visible(False)
-            continue
-        n_found += 1
-        d = pd.read_csv(path)
-        top = d[~d["is_shadow"]].nsmallest(top_k, "rank").iloc[::-1]
-        colors = ["#1D9E75" if v >= 0 else "#D85A30" for v in top["dir_corr"]]
-        ax.barh([_shorten(f, maxlen) for f in top["feature"]],
-                top["mean_abs_shap"], color=colors)
-        floor = top["noise_floor"].iloc[0] if len(top) else np.nan
-        if np.isfinite(floor):
-            ax.axvline(floor, color="#888780", linestyle="--", linewidth=0.7)
-        ax.set_title(st.upper(), fontsize=fs_title, pad=2)
-        ax.tick_params(axis="y", labelsize=fs_lab, pad=1, length=0)
-        ax.tick_params(axis="x", labelsize=fs_tick, pad=1, length=2)
-        if paper:
-            # Default locator crowds the narrow panels.
-            from matplotlib.ticker import MaxNLocator
-            ax.xaxis.set_major_locator(MaxNLocator(nbins=4, prune=None))
-            for side in ("top", "right"):
-                ax.spines[side].set_visible(False)
-            for side in ("left", "bottom"):
-                ax.spines[side].set_linewidth(0.5)
+    if paper and not usetex:
+        print("LaTeX not found: drawing the grid in matplotlib's default font.")
+    exts = ("pdf", "png") if not usetex or shutil.which("dvipng") else ("pdf",)
+    if len(exts) == 1:
+        print("dvipng not found: writing the PDF only.")
+    rc = ({"text.usetex": True, "font.family": "serif", "text.latex.preamble": LATEX_PREAMBLE}
+          if usetex else {})
+    label = _tex if usetex else str
+    with plt.rc_context(rc):
+        results_dir = Path(results_dir)
+        fig, axes = plt.subplots(4, 3, figsize=figsize)
+        n_found = 0
+        for ax, st in zip(axes.ravel(), GRID_STATES):
+            path = results_dir / f"shap_xgb_{st}_results.csv"
+            if not path.exists():
+                # Blank but keep the axes so the grid geometry stays fixed.
+                ax.set_title(f"{st.upper()} — missing", fontsize=fs_title, color="#888780")
+                ax.set_xticks([])
+                ax.set_yticks([])
+                for spine in ax.spines.values():
+                    spine.set_visible(False)
+                continue
+            n_found += 1
+            d = pd.read_csv(path)
+            top = d[~d["is_shadow"]].nsmallest(top_k, "rank").iloc[::-1]
+            fill, edge = _direction_colors(top["dir_corr"])
+            ax.barh([label(_shorten(f, maxlen)) for f in top["feature"]],
+                    top["mean_abs_shap"], color=fill, edgecolor=edge, linewidth=0.4)
+            ax.margins(y=0.02)
+            floor = top["noise_floor"].iloc[0] if len(top) else np.nan
+            if np.isfinite(floor):
+                ax.axvline(floor, color="#888780", linestyle="--", linewidth=0.7)
+            ax.set_title(st.upper(), fontsize=fs_title, pad=2)
+            ax.tick_params(axis="y", labelsize=fs_lab, pad=1, length=0)
+            ax.tick_params(axis="x", labelsize=fs_tick, pad=1, length=2)
+            if paper:
+                # Default locator crowds the narrow panels.
+                from matplotlib.ticker import MaxNLocator
+                ax.xaxis.set_major_locator(MaxNLocator(nbins=3, prune=None))
+                for side in ("top", "right"):
+                    ax.spines[side].set_visible(False)
+                for side in ("left", "bottom"):
+                    ax.spines[side].set_linewidth(0.5)
 
-    if fs_sup is not None:
-        fig.suptitle(f"Top-{top_k} features by mean |SHAP| (XGBoost regression), "
-                     "dashed line = shadow-feature noise floor", fontsize=fs_sup)
-    # Fixed geometry: tight_layout would resize panels around missing states.
-    fig.subplots_adjust(**margins)
-    figs = results_dir / "figs"
-    figs.mkdir(parents=True, exist_ok=True)
-    for ext in ("png", "pdf"):
-        fig.savefig(figs / f"shap_grid.{ext}", dpi=200)
-    plt.close(fig)
-    print(f"Grid figure written for {n_found}/{len(GRID_STATES)} states -> {figs}")
+        if fs_sup is not None:
+            fig.suptitle(f"Top-{top_k} features by mean |SHAP| (XGBoost regression), "
+                         "dashed line = shadow-feature noise floor", fontsize=fs_sup)
+        # Fixed geometry: tight_layout would resize panels around missing states.
+        _place_grid(fig, axes, **margins)
+        figs = results_dir / "figs"
+        figs.mkdir(parents=True, exist_ok=True)
+        for ext in exts:
+            fig.savefig(figs / f"shap_grid.{ext}", dpi=200)
+        plt.close(fig)
+        print(f"Grid figure written for {n_found}/{len(GRID_STATES)} states -> {figs}")
 
 
 # ---- Main ----
