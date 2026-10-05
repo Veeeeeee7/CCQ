@@ -44,6 +44,7 @@ conda install -y -c conda-forge "ffmpeg>=6,<8"
 | `shap_xgb.py` | Driving factor analysis: XGB-reg, TreeSHAP and shadow-feature noise floor |
 | `shap_seed_check.py` | Seed stability of the SHAP noise floor |
 | `count_tuned_params.py` | Tuned-parameter counts for the within-state Pareto figures |
+| `elo.py` | Within-state and cross-state Elo scores with bootstrap confidence intervals |
 | `download_qwen.py` | Downloads the Qwen3-4B checkpoint |
 
 `-num` methods read the *preprocessed* files; `-txt` methods read the *raw* files
@@ -143,6 +144,21 @@ run_target ga 3star $FIVE     # GA target: five-level pool collapsed to three le
 The transfer utility analysis (Figure 8b) compares the within-state results
 (step 2) with the p = 80 cross-state results; it needs no extra runs.
 
+## 5. Elo scores
+
+Run after steps 2 and 4. Each state and metric (BA, QWK) is one match between
+every pair of models, scored on the values as reported in the paper's tables
+(percentages to two decimals). The script reports the mean Elo over 2,000
+bootstrap rounds that resample the twelve states, with 95% intervals and RF-txt
+anchored at 1,000. Cross-state Elo is computed at each supervision level and
+averaged over the six levels.
+
+```bash
+python elo.py --results results --output results/elo    # Figure 5
+```
+
+With `--date`, point `--results` at `results/<date>`.
+
 ## Outputs
 
 ```
@@ -152,6 +168,7 @@ results/3_star/loso_ga_few_shot/experiment_loso_ga_few_shot_3star_results.csv
 results/shap_xgb/shap_xgb_{st}_results.csv, shap_xgb_qwk_check.csv, figs/
 results/shap_xgb_seed_check/shap_xgb_seed_check_mt.csv
 results/param_counts/param_counts_summary.csv
+results/elo/elo_within_state.csv, elo_cross_state.csv
 ```
 
 Result files are appended to, so re-running a cell adds a row; use a new `--date`
