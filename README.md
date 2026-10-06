@@ -1,5 +1,19 @@
 # CCQ: A Multi-State Child Care Quality Dataset
 
+When using this dataset, please cite our paper:
+
+```bibtex
+@article{li2026CCQ,
+  title   = {{CCQ}: A Multi-State Child Care Quality Dataset to Support {AI} for Children's Health Research},
+  author  = {Victor Li and Yuzhang Xie and Ziwei Dong and Qingyang Zhu and Wenjing Ma and Carl Yang and Jinbing Bai and Huiwen Xu and Jiaying Lu},
+  journal = {arXiv preprint arXiv:2610.05863},
+  year    = {2026},
+  url     = {https://arxiv.org/abs/2610.05863}
+}
+```
+
+Paper: <https://arxiv.org/abs/2610.05863>
+
 CCQ is a de-identified, provider-level dataset of child care quality ratings (QR)
 from the Quality Rating and Improvement Systems (QRIS) of 12 U.S. states. It
 covers **59,372 providers**, of which **29,073 (49.0%)** carry a published
