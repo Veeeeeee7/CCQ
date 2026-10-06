@@ -3,12 +3,14 @@
 When using this dataset, please cite our paper:
 
 ```bibtex
-@article{li2026CCQ,
-  title   = {{CCQ}: A Multi-State Child Care Quality Dataset to Support {AI} for Children's Health Research},
-  author  = {Victor Li and Yuzhang Xie and Ziwei Dong and Qingyang Zhu and Wenjing Ma and Carl Yang and Jinbing Bai and Huiwen Xu and Jiaying Lu},
-  journal = {arXiv preprint arXiv:2610.05863},
-  year    = {2026},
-  url     = {https://arxiv.org/abs/2610.05863}
+@misc{li2026ccqmultistatechildcare,
+      title={CCQ: A Multi-State Child Care Quality Dataset to Support AI for Children's Health Research}, 
+      author={Victor Li and Yuzhang Xie and Ziwei Dong and Qingyang Zhu and Wenjing Ma and Carl Yang and Jinbing Bai and Huiwen Xu and Jiaying Lu},
+      year={2026},
+      eprint={2610.05863},
+      archivePrefix={arXiv},
+      primaryClass={cs.LG},
+      url={https://arxiv.org/abs/2610.05863}, 
 }
 ```
 
