@@ -13,7 +13,7 @@ pip install -r requirements.txt
 conda install -y -c conda-forge "ffmpeg>=6,<8"
 ```
 
-- **Data.** Place the 24 released files in `data/`:
+- **Data.** Download the 24 released files from <https://huggingface.co/datasets/GAIN-Lab/CCQ> (gated: request access first) and place them in `data/`:
   `{st}_records_cleaned_full.csv` (*preprocessed*) and
   `{st}_records_cleaned_raw.csv` (*raw*) for `ca co ga ky md mt nc ne ok sc wa wi`.
 - **Qwen3-4B** (LLM-CLS / LLM-RAG / LLM-LoRA): `python download_qwen.py` saves it to

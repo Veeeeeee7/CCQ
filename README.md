@@ -14,7 +14,8 @@ When using this dataset, please cite our paper:
 }
 ```
 
-Paper: <https://arxiv.org/abs/2610.05863>
+Paper: <https://arxiv.org/abs/2610.05863>\
+Dataset: <https://huggingface.co/datasets/GAIN-Lab/CCQ>
 
 CCQ is a de-identified, provider-level dataset of child care quality ratings (QR)
 from the Quality Rating and Improvement Systems (QRIS) of 12 U.S. states. It
@@ -53,7 +54,8 @@ Every file starts with `provider_id` (a surrogate id, read as a string) and
 states).
 
 The dataset is hosted on Hugging Face as a gated dataset under the CC-BY-NC-SA
-4.0 license: <https://huggingface.co/datasets/jiayinglu/CCQ>.
+4.0 license (link above). This repository holds code only; download the CSVs
+from Hugging Face.
 
 ## Repository structure
 
